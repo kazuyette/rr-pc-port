@@ -12,6 +12,7 @@ add_executable(rr_pc_port
   src/main.c
   src/globals.c
   src/stubs.c
+  src/ported_logic.c
   src/psx_compat/psx_bios.c
 )
 
