@@ -45,6 +45,25 @@ add_executable(mapparse_tool
 target_include_directories(mapparse_tool PRIVATE tools/mapparse)
 target_compile_options(mapparse_tool PRIVATE -Wall -Wextra)
 
+# Phase 5 round 2: IDX.HED spatial-grid parser + combined MAP.RRM/IDX.HED
+# world-space plotter, and a directory-level OBJ.RRO parser. See
+# tools/mapparse/idx_hed.h and tools/mapparse/obj_rro.h for the format
+# writeups (confirmed vs. hypothesis, clearly separated).
+add_executable(worldmap_tool
+  tools/mapparse/worldmap_main.c
+  tools/mapparse/map_rrm.c
+  tools/mapparse/idx_hed.c
+)
+target_include_directories(worldmap_tool PRIVATE tools/mapparse)
+target_compile_options(worldmap_tool PRIVATE -Wall -Wextra)
+
+add_executable(objparse_tool
+  tools/mapparse/objparse_main.c
+  tools/mapparse/obj_rro.c
+)
+target_include_directories(objparse_tool PRIVATE tools/mapparse)
+target_compile_options(objparse_tool PRIVATE -Wall -Wextra)
+
 # SDL2 is optional: this is a HOST port scaffold, not the PSX cross build.
 # If SDL2 dev headers/libs aren't present, we build a headless binary that
 # still exercises the ported logic functions -- see ROADMAP.md phase 3/4

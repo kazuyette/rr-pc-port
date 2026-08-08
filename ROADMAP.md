@@ -219,6 +219,78 @@ the same level as MAP.RRM); the 16 not-yet-understood bytes of the
 MAP.RRM record; and no per-section transform, so nothing here is wired
 into the phase-3 rasterizer yet. That's the natural next round.
 
+### Phase 5, round 2 -- IDX.HED decoded as a world-space grid, partial MAP.RRM world transform, partial OBJ.RRO directory decode
+
+**Big find: IDX.HED is a 32x32 spatial hash grid, CONFIRMED byte-exact,
+and it is the missing MAP.RRM world-placement key.** Found by reading
+`func_80012C14` (a 64-step expanding-ring nearest-cell search used by
+gameplay/collision code) instruction-by-instruction: it indexes IDX.HED
+as `int16 grid[32][32]` (1024 entries * 2 bytes = 2048 bytes = the
+file's exact real size), where each occupied cell holds a MAP.RRM
+section index and empty cells hold `-1`. Checked exhaustively against
+the real files: exactly 258 of 1024 cells are occupied, and the 258
+values are the complete set `{0..257}` with **no repeats and no
+gaps -- a perfect bijection** between IDX.HED grid cells and MAP.RRM
+sections. Just plotting which cells are occupied (nothing from MAP.RRM
+involved at all) traces an unmistakable closed-loop racetrack shape, and
+color-coding by section index shows the section order flows
+continuously around that loop. `func_80012C14` also confirms the grid's
+cell size: world position is divided by 2048 (`>>11` with round-to-
+nearest) to get a cell coordinate -- a directly-read, not guessed,
+constant.
+
+Also cleared up a wrong assumption from last round's task framing:
+`func_80015CD4` (hypothesized as "the IDX.HED parser") turns out **not**
+to parse IDX.HED's contents at all -- it's a 15-instruction init
+function that just stores the raw buffer pointer into a global
+(`D_801D82D0`) and resets a few unrelated state globals. The real shape
+of IDX.HED only became clear from tracing `func_80012C14`, which reads
+through that pointer.
+
+**Partial, empirically-tuned world transform**: placing each MAP.RRM
+section's raw local record coordinates at `(mirrored_grid_col,
+grid_row) * 2048` (translation only, no rotation) produces a plot with
+real, recognizable road structure -- correct near/far quad edges, a
+clean sweeping curve and a long straight -- for roughly half the
+course. The remainder (tighter, more curved sections) still overlaps
+into a tangle. Two rotation hypotheses were tried (rotating each
+section by its records' candidate "heading" field; rotating by the
+direction to the next/previous section's grid cell) and **both made the
+result visibly worse**, so neither is applied -- the missing rotation
+component is a confirmed open problem, not yet found. New tool
+`worldmap_tool` (`tools/mapparse/idx_hed.h/.c` + `worldmap_main.c`)
+combines MAP.RRM + IDX.HED using this transform and exports a PPM; see
+`idx_hed.h`'s header comment for the full confirmed/hypothesis
+breakdown.
+
+**OBJ.RRO: directory structure decoded, data blobs not yet.** Read
+`func_80012670` (the OBJ.RRO parser) the same way. Confirmed: `uint32`
+object count (319 in the real file) + that many 16-byte directory
+entries, each holding 6 `int16` sub-counts multiplied by fixed
+per-item-type byte sizes (32/40/48/56/64/72 -- a clean `n*8` progression
+for `n=4..9`) that sum to a per-object byte size, accumulated into a
+running pointer written back into the following entry (same pattern as
+MAP.RRM's section-offset table, just done in-place in the OBJ.RRO
+buffer). Unlike MAP.RRM, this does **not** close exactly: the computed
+total (344428 bytes: 5108-byte directory + 339320 bytes of per-object
+data) falls short of the real 445348-byte file by 100920 bytes. Hex
+inspection at that boundary shows a distinct block that looks like
+vertex/coordinate data, so the leading hypothesis is a separate trailing
+vertex pool that `func_80012670` doesn't walk -- not confirmed, and the
+function that actually reads the per-object pointers this one writes
+(and would reveal what the data blobs contain) was not traced this
+round. New tool `objparse_tool` (`tools/mapparse/obj_rro.h/.c` +
+`objparse_main.c`) parses and reports the confirmed directory-level
+summary, including the unaccounted-bytes gap (surfaced, not hidden).
+
+Next round: (1) find the missing per-section rotation (candidates not
+yet tried: a per-*record*, not per-section, incremental heading chain;
+searching for a rotation/orientation field elsewhere in the section
+directory or IDX.HED itself); (2) trace whoever reads OBJ.RRO's
+per-object pointer field to decode the actual object data format; (3)
+once the transform is solid, wire real track geometry into the phase-3
+rasterizer.
+
 ## Phase 6 -- Audio
 
 SPU emulation or a from-scratch replacement audio engine, once there's
