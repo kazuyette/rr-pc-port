@@ -1,6 +1,6 @@
 /* rr-pc-port -- phase 1 vertical slice.
-   *
-   * Proves two things compile and run together on a normal host:
+ *
+ * Proves two things compile and run together on a normal host:
  *   1. Genuine ported decomp logic (src/globals.c, src/stubs.c), called
  *      through their original PS1 symbol names.
  *   2. An optional SDL2 window/event loop that degrades gracefully to a
@@ -12,13 +12,14 @@
  */
 #include <stdio.h>
 #include "ported.h"
+#include "ported_logic.h"
 
 #ifdef HAVE_SDL2
 #include <SDL2/SDL.h>
 #endif
 
 static void exercise_ported_functions(void) {
-      printf("-- exercising ported logic functions --\n");
+    printf("-- exercising ported logic functions --\n");
 
     printf("func_80021FA4(10, 3)  = %d (expect 7)\n", func_80021FA4(10, 3));
     printf("func_80021FA4(3, 10)  = %d (expect 7)\n", func_80021FA4(3, 10));
@@ -45,12 +46,48 @@ static void exercise_ported_functions(void) {
     printf("-- ported logic OK --\n");
 }
 
+static void exercise_ported_logic_round1(void) {
+    printf("-- exercising phase 2 round 1 ported logic (src/ported_logic.c) --\n");
+
+    printf("func_80055800() = %d (expect 3)\n", func_80055800());
+    printf("func_80055808() = %d (expect 1)\n", func_80055808());
+
+    printf("func_80059040() = %d (expect 1, global starts at 0)\n", func_80059040());
+
+    func_8004985C(0x1234);
+    printf("func_8004985C(0x1234) ran, no direct getter (paired global set)\n");
+
+    unsigned char obj[16] = {0};
+    func_80047B48(obj);
+    printf("func_80047B48(obj): obj[3]=%d obj[7]=0x%02X (expect 4, 0x20)\n", obj[3], obj[7]);
+
+    func_80047B20(obj, 1);
+    printf("func_80047B20(obj,1): obj[7]=0x%02X (expect 0x21, bit0 set)\n", obj[7]);
+    func_80047B20(obj, 0);
+    printf("func_80047B20(obj,0): obj[7]=0x%02X (expect 0x20, bit0 cleared)\n", obj[7]);
+
+    printf("func_80045738(42) = %d (expect 0, old value)\n", func_80045738(42));
+    printf("func_80045738(7)  = %d (expect 42, previous value)\n", func_80045738(7));
+
+    printf("func_80047920(0x30, 0x2) = 0x%X (expect 0x83)\n", func_80047920(0x30, 2));
+
+    printf("func_800554EC(0x10) = %d (expect 0, in range)\n", func_800554EC(0x10));
+    printf("func_800554EC(0x30) = %d (expect 1, out of range)\n", func_800554EC(0x30));
+
+    unsigned int word = 0;
+    unsigned char cnt[8] = {0, 0, 0, 5, 0, 0, 0, 0};
+    int rc = func_80047D24(cnt, &word);
+    printf("func_80047D24: rc=%d cnt[3]=%d word=0x%X (expect 0, 6, 0)\n", rc, cnt[3], word);
+
+    printf("-- phase 2 round 1 ported logic OK --\n");
+}
+
 #ifdef HAVE_SDL2
 static int run_sdl_loop(void) {
-      if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         printf("SDL_Init failed (%s) -- continuing headless\n", SDL_GetError());
         return 1;
-      }
+    }
 
     SDL_Window *window = SDL_CreateWindow(
         "rr-pc-port (phase 1)",
@@ -96,9 +133,10 @@ static int run_sdl_loop(void) {
 #endif
 
 int main(void) {
-      printf("rr-pc-port phase 1 vertical slice\n");
+    printf("rr-pc-port phase 1 vertical slice\n");
 
     exercise_ported_functions();
+    exercise_ported_logic_round1();
 
 #ifdef HAVE_SDL2
     if (run_sdl_loop() != 0) {
