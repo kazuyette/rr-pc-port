@@ -1,20 +1,26 @@
-/* rr-pc-port -- phase 1 vertical slice.
+/* rr-pc-port -- phase 1 + 2 + 3 vertical slice.
  *
- * Proves two things compile and run together on a normal host:
- *   1. Genuine ported decomp logic (src/globals.c, src/stubs.c), called
- *      through their original PS1 symbol names.
+ * Proves these things compile and run together on a normal host:
+ *   1. Genuine ported decomp logic (src/globals.c, src/stubs.c,
+ *      src/ported_logic.c), called through their original PS1 symbol
+ *      names.
  *   2. An optional SDL2 window/event loop that degrades gracefully to a
  *      headless run when SDL2 isn't available at build time, or when
  *      there's no display at run time (this sandbox has neither).
+ *   3. Phase 3: the software rasterizer (src/gpu/gpu_soft.c) drawing a
+ *      few hardcoded triangles into a raw framebuffer, blitted to the
+ *      SDL2 window each frame via a streaming texture. Hardcoded shapes
+ *      only -- no real game geometry yet, that's phase 5.
  *
- * This is scaffolding only -- no rendering of actual game geometry, no
- * asm-locked function, no audio. See ROADMAP.md.
+ * This is scaffolding -- no asm-locked function, no audio, no real
+ * geometry/textures. See ROADMAP.md.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "ported.h"
 #include "ported_logic.h"
+#include "gpu/gpu_soft.h"
 
 #ifdef HAVE_SDL2
 #include <SDL2/SDL.h>
@@ -85,6 +91,23 @@ static void exercise_ported_logic_round1(void) {
 }
 
 #ifdef HAVE_SDL2
+/* Phase 3: draw a small hardcoded scene into the software framebuffer
+ * every frame -- proof that the gpu_soft rasterizer -> SDL2 texture
+ * blit pipeline works end to end. Not real game geometry (that's phase
+ * 5, once MAP.RRM/OBJ.RRO are decoded); just enough to prove the
+ * pipeline before wiring anything real into it. */
+static void draw_hardcoded_scene(void) {
+    gpu_clear(0x00202060); /* same dark-blue as the old solid-clear background */
+
+    /* Main centered triangle. */
+    gpu_draw_triangle_flat(160, 60, 100, 180, 220, 180, 0x00FF3030); /* red */
+
+    /* Two smaller corner triangles so it's visually obvious more than
+     * one primitive is being rasterized. */
+    gpu_draw_triangle_flat(20, 20, 20, 70, 80, 70, 0x0030FF30);   /* green, top-left */
+    gpu_draw_triangle_flat(300, 220, 240, 220, 300, 170, 0x003080FF); /* blue, bottom-right */
+}
+
 static int run_sdl_loop(void) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         printf("SDL_Init failed (%s) -- continuing headless\n", SDL_GetError());
@@ -92,7 +115,7 @@ static int run_sdl_loop(void) {
     }
 
     SDL_Window *window = SDL_CreateWindow(
-        "rr-pc-port (phase 1)",
+        "rr-pc-port (phase 3 -- software rasterizer)",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         640, 480, SDL_WINDOW_SHOWN);
 
@@ -105,6 +128,21 @@ static int run_sdl_loop(void) {
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     if (!renderer) {
         printf("SDL_CreateRenderer failed (%s)\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    /* Streaming texture that gpu_framebuffer[] gets copied into every
+     * frame -- the standard SDL2 pattern for presenting a software-
+     * rendered framebuffer. SDL scales it up to fill the (larger)
+     * window automatically since we pass NULL src/dst rects below. */
+    SDL_Texture *fb_texture = SDL_CreateTexture(
+        renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING,
+        GPU_FB_WIDTH, GPU_FB_HEIGHT);
+    if (!fb_texture) {
+        printf("SDL_CreateTexture failed (%s)\n", SDL_GetError());
+        SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
@@ -131,8 +169,12 @@ static int run_sdl_loop(void) {
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
         }
 
-        SDL_SetRenderDrawColor(renderer, 32, 32, 96, 255);
+        draw_hardcoded_scene();
+        SDL_UpdateTexture(fb_texture, NULL, gpu_framebuffer,
+                           GPU_FB_WIDTH * (int)sizeof(uint32_t));
+
         SDL_RenderClear(renderer);
+        SDL_RenderCopy(renderer, fb_texture, NULL, NULL);
         SDL_RenderPresent(renderer);
 
         if (is_headless && SDL_GetTicks() - start > 2000) running = 0; /* headless/CI safety cap */
@@ -140,6 +182,7 @@ static int run_sdl_loop(void) {
 
     printf("SDL loop exited cleanly after %u ms\n", SDL_GetTicks() - start);
 
+    SDL_DestroyTexture(fb_texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
@@ -148,7 +191,7 @@ static int run_sdl_loop(void) {
 #endif
 
 int main(void) {
-    printf("rr-pc-port phase 1 vertical slice\n");
+    printf("rr-pc-port phase 1+2+3 vertical slice\n");
 
     exercise_ported_functions();
     exercise_ported_logic_round1();
@@ -161,6 +204,6 @@ int main(void) {
     printf("(built without SDL2 -- window/event loop skipped, logic-only run)\n");
 #endif
 
-    printf("phase 1 vertical slice complete, exiting 0\n");
+    printf("phase 1+2+3 vertical slice complete, exiting 0\n");
     return 0;
 }
