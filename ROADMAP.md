@@ -86,10 +86,71 @@ byte-match.
 Implement enough of a PS1 GPU emulation (as a software rasterizer first;
 consider an OpenGL backend later) to accept the primitive packet types
 the game submits (flat/gouraud tris & quads, sprites, lines) and draw
-something recognizable to an SDL2 texture/window. Start with wireframe
-or flat-fill only. This is the point where `psx_compat/psx_bios.h`'s
-`PsxBios_GpuSubmit` stub gets a real implementation and `SVECTOR` /
-`VECTOR` / `MATRIX` in `psx_types.h` start being used for real.
+something recognizable to an SDL2 texture/window.
+
+### Phase 3, milestone 1 -- DONE: hardcoded flat-triangle rasterization
+
+- `src/gpu/gpu_soft.h` + `gpu_soft.c`: a raw `uint32_t
+  gpu_framebuffer[GPU_FB_WIDTH * GPU_FB_HEIGHT]` (320x240, packed
+  0x00RRGGBB), `gpu_clear(color)`, and `gpu_draw_triangle_flat(x0, y0,
+  x1, y1, x2, y2, color)` -- a standard barycentric/edge-function
+  scanline fill, correctness over speed, no SDL dependency (touches
+  only the raw pixel array, so it's testable and backend-agnostic).
+- `src/gpu/gpu_soft_test.c`: standalone headless sanity check (own
+  CMake executable, `rr_pc_port_gpu_test`, wired into `ctest` via
+  `add_test`) asserting specific inside/outside pixels for a
+  hand-computed right triangle, a second non-overlapping triangle
+  (proves no bounding-box leakage), and a degenerate zero-area triangle
+  (proves it's a safe no-op). All checks pass headless, no display
+  needed -- this is how correctness was verified in this sandbox, which
+  has no display.
+- `src/main.c`'s SDL loop now does the real presentation pipeline every
+  frame: `gpu_clear()` + three hardcoded `gpu_draw_triangle_flat()`
+  calls (one centered red triangle, two smaller corner triangles in
+  green/blue so it's visually obvious multiple primitives are being
+  rasterized) into `gpu_framebuffer`, then `SDL_UpdateTexture` on an
+  `SDL_TEXTUREACCESS_STREAMING` texture (`SDL_PIXELFORMAT_RGB888`,
+  matching the packed 0x00RRGGBB layout) + `SDL_RenderCopy` +
+  `SDL_RenderPresent`. This replaces the old flat `SDL_RenderClear` to
+  a solid color. No real game geometry yet -- purely a hardcoded proof
+  that framebuffer -> texture -> window works end to end, ready for
+  phase 5 to eventually fill `gpu_framebuffer` from real geometry
+  instead of hardcoded shapes.
+
+### Phase 3, still to do
+
+- **Gouraud-shaded triangles**: per-vertex color + interpolation
+  (barycentric weights already computed in `gpu_draw_triangle_flat`,
+  extending to `gpu_draw_triangle_gouraud` with 3 colors is the natural
+  next step).
+- **Textured polygons**: UV coordinates per vertex, a texture/CLUT
+  sampling model matching the PS1 GPU's 4/8/16-bit texture page +
+  palette system (this needs Phase 5's TEX asset loading to have
+  anything real to sample from -- a checkerboard/solid placeholder
+  texture is enough to prove the sampling code path first).
+- **Quads and sprites**: the PS1 GPU natively submits flat/gouraud
+  quads (two triangles) and sprites (axis-aligned rects, often with a
+  fixed size); wrap `gpu_draw_triangle_flat`/`_gouraud` rather than
+  duplicating the fill loop.
+- **Lines**: simple Bresenham, lower priority (mostly used for debug
+  overlays and a few UI elements, not core track/car rendering).
+- **A `psx_bios.h` `PsxBios_GpuSubmit`-shaped entry point** that
+  receives PS1-style GPU primitive packets (the actual on-disc/RAM
+  packet layout the game code builds and submits, once traced from
+  `rr-decomp`) and dispatches to the right `gpu_draw_*` call -- this is
+  the real integration point between ported game-logic C and this
+  rasterizer, still to be built.
+- **Real geometry from Phase 5's asset loading**: once MAP.RRM/OBJ.RRO
+  are decoded, feed actual track/object vertex data through the same
+  primitive calls instead of the current hardcoded triangles. This is
+  the point where "hardcoded triangle on screen" becomes "the actual
+  game rendering something."
+- `SVECTOR` / `VECTOR` / `MATRIX` in `psx_compat/psx_types.h` aren't
+  used by the rasterizer yet (everything so far is 2D screen-space
+  integers, matching what the real PS1 GPU primitive packets carry
+  post-transform) -- they'll matter once the GTE-driven transform
+  pipeline (project 3D model-space vertices to screen space) is ported,
+  which is downstream of this milestone.
 
 ## Phase 4 -- BIOS / input / timing stubs
 

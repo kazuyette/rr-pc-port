@@ -14,10 +14,25 @@ add_executable(rr_pc_port
   src/stubs.c
   src/ported_logic.c
   src/psx_compat/psx_bios.c
+  src/gpu/gpu_soft.c
 )
 
 target_include_directories(rr_pc_port PRIVATE src)
 target_compile_options(rr_pc_port PRIVATE -Wall -Wextra)
+
+# Phase 3: headless sanity check for the software rasterizer, no SDL
+# needed -- exercises gpu_draw_triangle_flat() directly against the raw
+# framebuffer and asserts pixel colors. Runs fine in CI/sandboxes with
+# no display. See src/gpu/gpu_soft_test.c.
+add_executable(rr_pc_port_gpu_test
+  src/gpu/gpu_soft_test.c
+  src/gpu/gpu_soft.c
+)
+target_include_directories(rr_pc_port_gpu_test PRIVATE src/gpu)
+target_compile_options(rr_pc_port_gpu_test PRIVATE -Wall -Wextra)
+
+enable_testing()
+add_test(NAME gpu_soft_sanity COMMAND rr_pc_port_gpu_test)
 
 # SDL2 is optional: this is a HOST port scaffold, not the PSX cross build.
 # If SDL2 dev headers/libs aren't present, we build a headless binary that
