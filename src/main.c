@@ -11,6 +11,8 @@
  * asm-locked function, no audio. See ROADMAP.md.
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "ported.h"
 #include "ported_logic.h"
 
@@ -108,19 +110,32 @@ static int run_sdl_loop(void) {
         return 1;
     }
 
+    /* CI/headless runs force SDL_VIDEODRIVER=dummy (no real window ever
+     * appears, nothing for a human to look at) -- keep the old 2s safety
+     * cap there so the workflow can't hang. On a real display, stay open
+     * until the user closes the window (or Escape), same as any normal
+     * app -- flashing open/closed after 2s was confusing on a real
+     * desktop, it looked like a crash rather than "working as intended". */
+    const char *video_driver = getenv("SDL_VIDEODRIVER");
+    int is_headless = video_driver && strcmp(video_driver, "dummy") == 0;
+    if (!is_headless) {
+        printf("window open -- close it (or press Escape) to exit\n");
+    }
+
     Uint32 start = SDL_GetTicks();
     int running = 1;
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
         }
 
         SDL_SetRenderDrawColor(renderer, 32, 32, 96, 255);
         SDL_RenderClear(renderer);
         SDL_RenderPresent(renderer);
 
-        if (SDL_GetTicks() - start > 2000) running = 0; /* headless/CI safety cap */
+        if (is_headless && SDL_GetTicks() - start > 2000) running = 0; /* headless/CI safety cap */
     }
 
     printf("SDL loop exited cleanly after %u ms\n", SDL_GetTicks() - start);
