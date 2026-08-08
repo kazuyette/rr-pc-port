@@ -34,6 +34,17 @@ target_compile_options(rr_pc_port_gpu_test PRIVATE -Wall -Wextra)
 enable_testing()
 add_test(NAME gpu_soft_sanity COMMAND rr_pc_port_gpu_test)
 
+# Track-data reverse-engineering tool: standalone CLI, no game/PSX
+# dependencies. Parses a MAP.RRM file (from the user's own local disc
+# extraction, never committed to this repo) and prints/exports its
+# structure. See tools/mapparse/map_rrm.h for the format writeup.
+add_executable(mapparse_tool
+  tools/mapparse/mapparse_main.c
+  tools/mapparse/map_rrm.c
+)
+target_include_directories(mapparse_tool PRIVATE tools/mapparse)
+target_compile_options(mapparse_tool PRIVATE -Wall -Wextra)
+
 # SDL2 is optional: this is a HOST port scaffold, not the PSX cross build.
 # If SDL2 dev headers/libs aren't present, we build a headless binary that
 # still exercises the ported logic functions -- see ROADMAP.md phase 3/4

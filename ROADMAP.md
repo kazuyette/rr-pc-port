@@ -169,6 +169,56 @@ ported game logic and phase-3 rasterizer expect. Extracted assets
 themselves are never committed here -- only the loader code, tested
 against the user's own legally-owned disc image locally.
 
+### Phase 5, round 1 -- MAP.RRM file-level structure decoded, standalone parser tool added
+
+`tools/mapparse/` (`map_rrm.h`/`.c` + `mapparse_main.c`) is a standalone
+host CLI (no PSX/game dependencies, not linked into `rr_pc_port`) that
+parses a locally-supplied MAP.RRM file. It was written after tracing the
+real PS1 boot-time load path in rr-decomp: the `\MAP.RRM;1` rodata
+string -> a 10-entry CD filename pointer table -> `func_80032A54` (loads
+all 8 CD-directory-resident data files at boot) -> `func_80032948`
+(CD-read one file by directory entry) -> `func_800125B4` (the actual
+MAP.RRM header/directory parser, called on the freshly CD-read buffer).
+
+**Confirmed, byte-exact** (replayed `func_800125B4`'s accumulation
+arithmetic against the real file and it consumes it with zero slack):
+MAP.RRM is `uint16 section_count` (258 for RR1's one course) + that many
+8-byte directory entries (`{count_a, count_b, count_c, count_d}`,
+`count_d` observed always 0) + a single flat bulk-data stream of fixed
+40-byte records, laid out per-section as `count_a` type-A records then
+`count_b` type-B then `count_c` type-C, section by section. 258 sections
+-> 6737 total records (622 A + 5420 B + 695 C) -> exactly fills the
+remaining 269480 bytes of the 271548-byte file.
+
+**Best-effort, not confirmed**: the 40-byte record's internal fields.
+The first 24 bytes decode as four `int16[3]` vectors; for most type-B
+records (by far the most common type) the 1st and 2nd vectors share
+their middle component, and so do the 3rd/4th, matching the signature of
+a road-surface quad's near-edge/far-edge corner pairs sharing a common
+height. The remaining 16 bytes have weaker hypotheses only (candidate
+heading angle, candidate group/material id, candidate flags word) -- see
+the header comment in `map_rrm.h` for the full, explicitly-hedged
+writeup, including what was tried and didn't confirm (no per-section
+world-space transform was found, so a top-down plot of the raw v0
+corners is a single dense local-frame blob, not a track outline -- this
+was checked and is an honest negative result, not a bug).
+
+`mapparse_tool` (new CMake target, `tools/mapparse/`, unrelated to the
+main `rr_pc_port`/`rr_pc_port_gpu_test` targets, builds cleanly alongside
+them with zero warnings under `-Wall -Wextra`) prints this summary and
+can optionally dump a CSV of every parsed record or a color-coded PPM
+scatter plot for visual sanity-checking. Verified locally against the
+real MAP.RRM (asset never committed): `bytes_consumed == file size`
+exactly, matching the byte-exact math above.
+
+Not yet done: OBJ.RRO (scenery objects) and IDX.HED were not
+investigated this round (loader functions `func_80012670` and
+`func_80015CD4` were located and IDX.HED's stride at least skimmed
+during this round -- see the fuller project notes -- but not decoded to
+the same level as MAP.RRM); the 16 not-yet-understood bytes of the
+MAP.RRM record; and no per-section transform, so nothing here is wired
+into the phase-3 rasterizer yet. That's the natural next round.
+
 ## Phase 6 -- Audio
 
 SPU emulation or a from-scratch replacement audio engine, once there's
