@@ -304,23 +304,41 @@ static int track_demo_is_real_road_section(const MapRrmFile *mf, uint16_t sectio
     return ((int)d->count_a + (int)d->count_b + (int)d->count_c) > 2;
 }
 
-/* Static top-down render of the real track: one filled quad per
- * type-B (road surface) record, world position = local record vertex
- * + IDX.HED grid-cell anchor (translation-only, no rotation -- see
- * file header comment). Fits the whole track into the framebuffer with
- * a small margin, preserving aspect ratio. */
+/* Interactive view state for track demo mode: `zoom` multiplies the
+ * auto-fit scale (1.0 = whole track fits on screen), `pan_x`/`pan_z`
+ * shift the view center in WORLD units (not screen pixels, so panning
+ * feels consistent at any zoom level). Arrow keys pan, +/- zoom, R
+ * resets -- wired up in run_sdl_loop's event loop below. File-scope
+ * since there is only ever one track demo view per process. */
+static double s_track_zoom = 1.0;
+static double s_track_pan_x = 0.0, s_track_pan_z = 0.0;
+
+static void track_view_reset(void) {
+    s_track_zoom = 1.0;
+    s_track_pan_x = 0.0;
+    s_track_pan_z = 0.0;
+}
+
+/* Top-down render of the real track: one filled quad per type-B (road
+ * surface) record, world position = local record vertex + IDX.HED
+ * grid-cell anchor (translation-only, no rotation -- see file header
+ * comment). `s_track_zoom`==1.0 and no pan fits the whole track on
+ * screen preserving aspect ratio; arrow keys/+/- let the user explore
+ * closer, since round 10's small residual notches (very-high-record
+ * junction sections) are easiest to inspect zoomed in. */
 static void draw_track_demo_scene(const TrackDemo *td) {
     const MapRrmFile *mf = &td->mf;
     const IdxHedFile *idxf = &td->idxf;
     double minx = 1e18, maxx = -1e18, minz = 1e18, maxz = -1e18;
-    double scale;
-    int margin = 6;
+    double fit_scale, scale, cx, cz;
     size_t r;
+    int margin = 6;
 
     gpu_clear(0x00080810);
 
     /* Pass 1: world-space bbox over the same record set we're about to
-     * draw (real-road sections, type B only). */
+     * draw (real-road sections, type B only) -- used both to compute
+     * the auto-fit scale and as the default view center. */
     for (r = 0; r < mf->record_count; r++) {
         const MapRrmTaggedRecord *tr = &mf->records[r];
         int32_t ox, oz;
@@ -341,16 +359,21 @@ static void draw_track_demo_scene(const TrackDemo *td) {
         return; /* nothing to draw (e.g. IDX.HED had zero occupied cells) */
     }
 
-    scale = (double)(GPU_FB_WIDTH - 2 * margin) / (maxx - minx + 1);
+    fit_scale = (double)(GPU_FB_WIDTH - 2 * margin) / (maxx - minx + 1);
     {
         double scale_z = (double)(GPU_FB_HEIGHT - 2 * margin) / (maxz - minz + 1);
-        if (scale_z < scale) scale = scale_z;
+        if (scale_z < fit_scale) fit_scale = scale_z;
     }
+    scale = fit_scale * s_track_zoom;
+    cx = (minx + maxx) / 2.0 + s_track_pan_x;
+    cz = (minz + maxz) / 2.0 + s_track_pan_z;
 
     /* Pass 2: fill each qualifying type-B record as a solid quad --
      * corners ordered v0,v1,v3,v2 around the perimeter (matches
      * gpu_draw_quad_flat's expected winding and worldmap_main.c's
-     * confirmed-correct ordering, avoiding a bowtie). */
+     * confirmed-correct ordering, avoiding a bowtie). Projection is
+     * centered on (cx,cz) rather than the old min-corner+margin
+     * convention, since pan/zoom need a stable center to zoom toward. */
     for (r = 0; r < mf->record_count; r++) {
         const MapRrmTaggedRecord *tr = &mf->records[r];
         int32_t ox, oz;
@@ -359,14 +382,14 @@ static void draw_track_demo_scene(const TrackDemo *td) {
         if (!track_demo_is_real_road_section(mf, tr->section_index)) continue;
         if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
 
-        x0 = (int)(((ox + tr->rec.v0[0]) - minx) * scale) + margin;
-        y0 = (int)(((oz + tr->rec.v0[2]) - minz) * scale) + margin;
-        x1 = (int)(((ox + tr->rec.v1[0]) - minx) * scale) + margin;
-        y1 = (int)(((oz + tr->rec.v1[2]) - minz) * scale) + margin;
-        x2 = (int)(((ox + tr->rec.v3[0]) - minx) * scale) + margin; /* note: v3 before v2 -- perimeter order */
-        y2 = (int)(((oz + tr->rec.v3[2]) - minz) * scale) + margin;
-        x3 = (int)(((ox + tr->rec.v2[0]) - minx) * scale) + margin;
-        y3 = (int)(((oz + tr->rec.v2[2]) - minz) * scale) + margin;
+        x0 = (int)(((ox + tr->rec.v0[0]) - cx) * scale) + GPU_FB_WIDTH / 2;
+        y0 = (int)(((oz + tr->rec.v0[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
+        x1 = (int)(((ox + tr->rec.v1[0]) - cx) * scale) + GPU_FB_WIDTH / 2;
+        y1 = (int)(((oz + tr->rec.v1[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
+        x2 = (int)(((ox + tr->rec.v3[0]) - cx) * scale) + GPU_FB_WIDTH / 2; /* note: v3 before v2 -- perimeter order */
+        y2 = (int)(((oz + tr->rec.v3[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
+        x3 = (int)(((ox + tr->rec.v2[0]) - cx) * scale) + GPU_FB_WIDTH / 2;
+        y3 = (int)(((oz + tr->rec.v2[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
 
         gpu_draw_quad_flat(x0, y0, x1, y1, x2, y2, x3, y3, 0x003C965A);
     }
@@ -537,6 +560,10 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
     int is_headless = video_driver && strcmp(video_driver, "dummy") == 0;
     if (!is_headless) {
         printf("window open -- close it (or press Escape) to exit\n");
+        if (track != NULL && track->ready) {
+            printf("track demo controls: arrow keys pan, +/- zoom, R resets view\n");
+            track_view_reset();
+        }
     }
 
     Uint32 start = SDL_GetTicks();
@@ -545,7 +572,38 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = 0;
-            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
+            if (ev.type == SDL_KEYDOWN) {
+                switch (ev.key.keysym.sym) {
+                    case SDLK_ESCAPE: running = 0; break;
+                    default: break;
+                }
+                if (track != NULL && track->ready) {
+                    /* Pan step is in world units, scaled down as zoom
+                     * increases so a keypress always moves about the
+                     * same fraction of the visible view, not a fixed
+                     * world distance that would fly off-screen at high
+                     * zoom or crawl at low zoom. */
+                    double pan_step = 300.0 / s_track_zoom;
+                    switch (ev.key.keysym.sym) {
+                        case SDLK_LEFT:  s_track_pan_x -= pan_step; break;
+                        case SDLK_RIGHT: s_track_pan_x += pan_step; break;
+                        case SDLK_UP:    s_track_pan_z -= pan_step; break;
+                        case SDLK_DOWN:  s_track_pan_z += pan_step; break;
+                        case SDLK_EQUALS: case SDLK_KP_PLUS:
+                            s_track_zoom *= 1.2;
+                            if (s_track_zoom > 40.0) s_track_zoom = 40.0;
+                            break;
+                        case SDLK_MINUS: case SDLK_KP_MINUS:
+                            s_track_zoom /= 1.2;
+                            if (s_track_zoom < 0.2) s_track_zoom = 0.2;
+                            break;
+                        case SDLK_r:
+                            track_view_reset();
+                            break;
+                        default: break;
+                    }
+                }
+            }
         }
 
         if (tex_page != NULL) {
