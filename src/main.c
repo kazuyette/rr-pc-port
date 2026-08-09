@@ -23,10 +23,25 @@
  *      The TEX*.TMS file itself is never bundled/committed -- point
  *      this at your own local extraction, e.g.:
  *        ./rr_pc_port /path/to/TEX0.TMS
+ *   5. Real-track demo mode: if invoked with `--track <MAP.RRM>
+ *      <IDX.HED>`, parses both files (tools/mapparse/map_rrm.c +
+ *      idx_hed.c) and draws a static top-down view of the real track
+ *      using gpu_draw_quad_flat() -- one filled quad per type-B (road
+ *      surface) record, translated to its section's IDX.HED grid-cell
+ *      anchor (the round 8-10 confirmed, byte/algebra-verified
+ *      translation-only placement model; see project memory
+ *      rr_pc_port_round8.md..round10.md and tools/mapparse/worldmap_main.c,
+ *      whose standalone-PPM version of this exact rendering approach
+ *      this mode mirrors, now flowing through the real rasterizer
+ *      instead of a raw PPM writer). Sections with <=2 total records
+ *      are skipped (round 10 finding: markers/junction nodes, not road
+ *      geometry). Both files are never bundled/committed -- point this
+ *      at your own local extraction, e.g.:
+ *        ./rr_pc_port --track /path/to/MAP.RRM /path/to/IDX.HED
  *
- * This is scaffolding -- no asm-locked function, no audio, no real
- * geometry yet (real textures now flow through, real MAP.RRM/OBJ.RRO
- * geometry is still phase 5). See ROADMAP.md.
+ * This is scaffolding -- no asm-locked function, no audio, and the
+ * track demo above is a static top-down debug view (not a playable
+ * driving camera yet -- that's a later phase). See ROADMAP.md.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +55,8 @@
 #include "ported_logic.h"
 #include "gpu/gpu_soft.h"
 #include "tim.h"
+#include "map_rrm.h"
+#include "idx_hed.h"
 
 #ifdef HAVE_SDL2
 #include <SDL2/SDL.h>
@@ -217,6 +234,144 @@ static void draw_texture_demo_scene(const TimPage *page) {
                             page->rgba, page->width, page->height);
 }
 
+/* Holds the two parsed files for track demo mode, plus whether loading
+ * succeeded -- mirrors the load_demo_texture_page()/TimPage pattern
+ * above. Owned/freed by main() via track_demo_free(). */
+typedef struct {
+    MapRrmFile mf;
+    IdxHedFile idxf;
+    int ready;
+} TrackDemo;
+
+static void track_demo_free(TrackDemo *td) {
+    if (td->ready) {
+        map_rrm_free(&td->mf);
+    }
+    memset(td, 0, sizeof(*td));
+}
+
+/* Loads and parses MAP.RRM + IDX.HED for track demo mode. On success
+ * returns 1 with td->ready=1; on any failure prints a diagnostic,
+ * leaves td zeroed/ready=0, and returns 0 (caller falls back to the
+ * animated demo, same graceful-degradation pattern as texture mode). */
+static int load_demo_track(const char *map_path, const char *idx_path, TrackDemo *td) {
+    uint8_t *map_buf, *idx_buf;
+    size_t map_size = 0, idx_size = 0;
+    int rc;
+
+    memset(td, 0, sizeof(*td));
+
+    map_buf = read_whole_file(map_path, &map_size);
+    idx_buf = read_whole_file(idx_path, &idx_size);
+    if (map_buf == NULL || idx_buf == NULL) {
+        free(map_buf);
+        free(idx_buf);
+        return 0;
+    }
+
+    rc = map_rrm_parse(map_buf, map_size, &td->mf);
+    free(map_buf);
+    if (rc != MAP_RRM_OK) {
+        printf("track demo: MAP.RRM parse failed (%d)\n", rc);
+        free(idx_buf);
+        return 0;
+    }
+
+    rc = idx_hed_parse(idx_buf, idx_size, &td->idxf);
+    free(idx_buf);
+    if (rc != IDX_HED_OK) {
+        printf("track demo: IDX.HED parse failed (%d)\n", rc);
+        map_rrm_free(&td->mf);
+        memset(td, 0, sizeof(*td));
+        return 0;
+    }
+
+    printf("track demo: parsed %u sections / %zu records from '%s' + '%s'\n",
+           (unsigned)td->mf.section_count, td->mf.record_count, map_path, idx_path);
+    td->ready = 1;
+    return 1;
+}
+
+/* A section is only drawn if it has more than 2 total records --
+ * round 10 finding: <=2-record sections are very likely markers/
+ * junction nodes rather than ordinary road geometry, and including
+ * them adds noise without adding real track shape (matches
+ * tools/mapparse/worldmap_main.c's IS_REAL_ROAD_SECTION filter). */
+static int track_demo_is_real_road_section(const MapRrmFile *mf, uint16_t section_index) {
+    const MapRrmSectionDir *d;
+    if (section_index >= mf->section_count) return 0;
+    d = &mf->sections[section_index];
+    return ((int)d->count_a + (int)d->count_b + (int)d->count_c) > 2;
+}
+
+/* Static top-down render of the real track: one filled quad per
+ * type-B (road surface) record, world position = local record vertex
+ * + IDX.HED grid-cell anchor (translation-only, no rotation -- see
+ * file header comment). Fits the whole track into the framebuffer with
+ * a small margin, preserving aspect ratio. */
+static void draw_track_demo_scene(const TrackDemo *td) {
+    const MapRrmFile *mf = &td->mf;
+    const IdxHedFile *idxf = &td->idxf;
+    double minx = 1e18, maxx = -1e18, minz = 1e18, maxz = -1e18;
+    double scale;
+    int margin = 6;
+    size_t r;
+
+    gpu_clear(0x00080810);
+
+    /* Pass 1: world-space bbox over the same record set we're about to
+     * draw (real-road sections, type B only). */
+    for (r = 0; r < mf->record_count; r++) {
+        const MapRrmTaggedRecord *tr = &mf->records[r];
+        int32_t ox, oz;
+        int c;
+        if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
+        if (!track_demo_is_real_road_section(mf, tr->section_index)) continue;
+        if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
+        for (c = 0; c < 4; c++) {
+            const int16_t *v = (c == 0) ? tr->rec.v0 : (c == 1) ? tr->rec.v1 : (c == 2) ? tr->rec.v2 : tr->rec.v3;
+            double wx = ox + v[0], wz = oz + v[2];
+            if (wx < minx) minx = wx;
+            if (wx > maxx) maxx = wx;
+            if (wz < minz) minz = wz;
+            if (wz > maxz) maxz = wz;
+        }
+    }
+    if (maxx <= minx || maxz <= minz) {
+        return; /* nothing to draw (e.g. IDX.HED had zero occupied cells) */
+    }
+
+    scale = (double)(GPU_FB_WIDTH - 2 * margin) / (maxx - minx + 1);
+    {
+        double scale_z = (double)(GPU_FB_HEIGHT - 2 * margin) / (maxz - minz + 1);
+        if (scale_z < scale) scale = scale_z;
+    }
+
+    /* Pass 2: fill each qualifying type-B record as a solid quad --
+     * corners ordered v0,v1,v3,v2 around the perimeter (matches
+     * gpu_draw_quad_flat's expected winding and worldmap_main.c's
+     * confirmed-correct ordering, avoiding a bowtie). */
+    for (r = 0; r < mf->record_count; r++) {
+        const MapRrmTaggedRecord *tr = &mf->records[r];
+        int32_t ox, oz;
+        int x0, y0, x1, y1, x2, y2, x3, y3;
+        if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
+        if (!track_demo_is_real_road_section(mf, tr->section_index)) continue;
+        if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
+
+        x0 = (int)(((ox + tr->rec.v0[0]) - minx) * scale) + margin;
+        y0 = (int)(((oz + tr->rec.v0[2]) - minz) * scale) + margin;
+        x1 = (int)(((ox + tr->rec.v1[0]) - minx) * scale) + margin;
+        y1 = (int)(((oz + tr->rec.v1[2]) - minz) * scale) + margin;
+        x2 = (int)(((ox + tr->rec.v3[0]) - minx) * scale) + margin; /* note: v3 before v2 -- perimeter order */
+        y2 = (int)(((oz + tr->rec.v3[2]) - minz) * scale) + margin;
+        x3 = (int)(((ox + tr->rec.v2[0]) - minx) * scale) + margin;
+        y3 = (int)(((oz + tr->rec.v2[2]) - minz) * scale) + margin;
+
+        gpu_draw_quad_flat(x0, y0, x1, y1, x2, y2, x3, y3, 0x003C965A);
+    }
+}
+
 #ifdef HAVE_SDL2
 /* Cosine-based color cycler: three sine waves 120 degrees apart give a
  * smooth, seamless-looping RGB cycle. `phase` offsets which point in
@@ -321,13 +476,16 @@ static void draw_animated_scene(Uint32 now_ms) {
     }
 }
 
-/* `tex_page` selects which scene the loop draws every frame: NULL runs
- * the original phase 1-3 animated demo unchanged; non-NULL switches to
- * the static real-texture demo (draw_texture_demo_scene) instead, and
- * the window title reflects which mode is active. */
-static int run_sdl_loop(const TimPage *tex_page) {
+/* `tex_page` and `track` together select which scene the loop draws
+ * every frame: tex_page non-NULL takes priority (real-texture demo),
+ * else track->ready draws the real-track demo, else the original
+ * phase 1-3 animated demo runs unchanged. Window title reflects
+ * whichever mode is active. */
+static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
     const char *title = (tex_page != NULL)
         ? "rr-pc-port (real texture demo -- decoded from a TEX*.TMS file)"
+        : (track != NULL && track->ready)
+        ? "rr-pc-port (real track demo -- decoded from MAP.RRM/IDX.HED)"
         : "rr-pc-port (phase 3 -- software rasterizer)";
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -392,6 +550,8 @@ static int run_sdl_loop(const TimPage *tex_page) {
 
         if (tex_page != NULL) {
             draw_texture_demo_scene(tex_page);
+        } else if (track != NULL && track->ready) {
+            draw_track_demo_scene(track);
         } else {
             draw_animated_scene(SDL_GetTicks() - start);
         }
@@ -416,16 +576,27 @@ static int run_sdl_loop(const TimPage *tex_page) {
 #endif
 
 int main(int argc, char **argv) {
-    /* Optional real-texture demo mode: `rr_pc_port /path/to/TEX0.TMS`.
-     * With no argument, behavior is exactly the original phase 1-3
-     * animated demo -- this is purely additive. See the file header
-     * comment and load_demo_texture_page()/draw_texture_demo_scene()
-     * above for what this does. */
-    const char *tex_path = (argc > 1) ? argv[1] : NULL;
+    /* Optional demo modes, both purely additive over the default phase
+     * 1-3 animated demo:
+     *   rr_pc_port /path/to/TEX0.TMS                  -- texture demo
+     *   rr_pc_port --track /path/to/MAP.RRM /path/to/IDX.HED -- track demo
+     * See the file header comment and the load_demo_*()/draw_*_scene()
+     * functions above for what each does. */
+    const char *tex_path = NULL;
+    const char *track_map_path = NULL, *track_idx_path = NULL;
     TimFile tex_file;
     const TimPage *tex_page = NULL;
+    TrackDemo track;
 
     memset(&tex_file, 0, sizeof(tex_file));
+    memset(&track, 0, sizeof(track));
+
+    if (argc > 1 && strcmp(argv[1], "--track") == 0) {
+        if (argc > 2) track_map_path = argv[2];
+        if (argc > 3) track_idx_path = argv[3];
+    } else if (argc > 1) {
+        tex_path = argv[1];
+    }
 
     printf("rr-pc-port phase 1+2+3 vertical slice\n");
 
@@ -438,10 +609,16 @@ int main(int argc, char **argv) {
         /* On failure, tex_page stays NULL -- falls back to the animated
          * demo below rather than crashing or exiting, so a bad path
          * doesn't break the rest of the vertical slice. */
+    } else if (track_map_path != NULL && track_idx_path != NULL) {
+        printf("-- track demo mode: loading '%s' + '%s' --\n", track_map_path, track_idx_path);
+        load_demo_track(track_map_path, track_idx_path, &track);
+        /* On failure, track.ready stays 0 -- same graceful fallback. */
+    } else if (track_map_path != NULL) {
+        printf("--track requires both <MAP.RRM> <IDX.HED> paths -- falling back to animated demo\n");
     }
 
 #ifdef HAVE_SDL2
-    if (run_sdl_loop(tex_page) != 0) {
+    if (run_sdl_loop(tex_page, &track) != 0) {
         printf("(no usable display -- window/event loop skipped, logic-only run)\n");
     }
 #else
@@ -462,12 +639,25 @@ int main(int argc, char **argv) {
                tex_page->width, tex_page->height,
                distinct ? "framebuffer shows real variation (not solid color)"
                         : "WARNING: framebuffer is a single solid color");
+    } else if (track.ready) {
+        int px, distinct = 0;
+        uint32_t first;
+        draw_track_demo_scene(&track);
+        first = gpu_framebuffer[0];
+        for (px = 0; px < GPU_FB_WIDTH * GPU_FB_HEIGHT; px++) {
+            if (gpu_framebuffer[px] != first) { distinct = 1; break; }
+        }
+        printf("(built without SDL2 -- headless track demo: drew the track into "
+               "gpu_framebuffer[], %s)\n",
+               distinct ? "framebuffer shows real variation (not solid color)"
+                        : "WARNING: framebuffer is a single solid color");
     } else {
         printf("(built without SDL2 -- window/event loop skipped, logic-only run)\n");
     }
 #endif
 
     tim_free(&tex_file);
+    track_demo_free(&track);
 
     printf("phase 1+2+3 vertical slice complete, exiting 0\n");
     return 0;
