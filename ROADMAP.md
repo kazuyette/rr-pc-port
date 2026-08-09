@@ -466,6 +466,108 @@ Zero regressions: this round was investigation + documentation only
 (no functional code changes), full build/test suite untouched and
 still passing. No rasterizer wiring -- rotation still unresolved.
 
+### Phase 5, rounds 5-6 -- Ghidra-assisted rotation hunt (investigation only, no code changes; see project notes)
+
+Two further rounds traced the render-time GTE rotation call graph using a
+live Ghidra MCP bridge (not available in every session): the section
+table's scratchpad pointer (`DAT_1F80003C`) has **zero static reads**
+anywhere in the binary, and a full 41-caller xref census of the BAMS trig
+table found no call site that builds a rotation matrix from MAP.RRM
+section data -- confirming the road renderer is reached exclusively
+through a runtime function-pointer dispatch invisible to static
+analysis. Round 6 also ran an exhaustive 64-combination brute-force
+search over every plausible sign/axis convention for the existing
+translation-only transform: all 64 combinations tie for best score, and
+the best case still only gets 5.9% of grid-adjacent section pairs to a
+clean (<200 unit) junction -- proving numerically that a *real*
+per-section rotation is structurally required, not a convention bug.
+Neither round changed any code in this repo (investigation only); full
+detail in project memory, not duplicated here.
+
+### Phase 5, round 7b -- empirical/statistical rotation reconstruction attempt: NEGATIVE result, but a stronger and more direct one than rounds 3-6
+
+With 6 rounds of static binary analysis exhausted (see above), this
+round tried a completely different approach: instead of finding the
+game's exact mechanism, **least-squares fit** a per-section rotation
+directly from the geometry -- i.e. build a working reconstruction even
+without decoding the original algorithm. New standalone tool:
+`tools/rotation_fit/rotation_fit.py` (Python + numpy, deliberately
+outside the CMake build -- a research tool, not production parsing
+code). Run it yourself against your own legally-owned files:
+
+```
+python3 tools/rotation_fit/rotation_fit.py <MAP.RRM> <IDX.HED> --figure report.png
+```
+
+**New structural finding along the way**: the previously-assumed "type-B
+records chain end-to-end within a section" model needed correcting --
+the real near/far edge correspondence is `record[k].v0,v1 ~=
+record[k+1].v2,v3` (the opposite direction from earlier rounds' guess),
+and it only holds within short runs a few records long, broken by
+`group_id` boundaries *and* periodic resets even within one `group_id`
+(most likely tiled/repeating geometry, e.g. guardrail segments, each
+restarting from its own local origin) -- a section's type-B run is not
+one single path, contrary to what was assumed for the round-3 dead-
+reckoning attempt.
+
+**Two independent rotation-fitting methodologies were tried:**
+
+1. A chained per-section rotation fit propagated around the full
+   258-section index-order loop (closed-form optimal-rotation-only
+   alignment at each step). The final wraparound angular closure gap
+   was small-looking (~12-18 degrees), but the *per-transition* fit
+   quality along the way was bad -- median ~4500 world-unit corner
+   mismatch, only ~18% of transitions within one grid cell (worse than
+   the existing translation-only baseline's 85.9%). A small closing
+   angle built from a chain of individually bad fits isn't trustworthy
+   on its own.
+2. **The methodologically decisive test**: independently (not chained)
+   brute-force fit the best rotation for each of ~300 IDX.HED-grid-
+   adjacent section pairs, then check **cycle consistency** around the
+   98 real 2x2 "small loops" in the grid graph (four sections where all
+   four pairwise edges are grid-adjacent) -- if a single true
+   per-section rotation existed, the four independently-fit relative
+   rotations around each loop should sum to ~0 degrees. They do not:
+   median closure error 65-66 degrees (mean ~70), barely better than
+   the ~90 degrees expected from unrelated/random angles, and only 8.2%
+   of loops close within 10 degrees. A control test against random
+   unrelated section pairs confirms the underlying "nearest-corner"
+   metric isn't simply too permissive to be meaningful (random pairs do
+   much worse), so this is a real negative finding about the model
+   shape, not a metric artifact.
+
+**Conclusion**: a single rigid rotation per section (about the section's
+local coordinate origin, combined with the existing IDX.HED grid-cell
+translation) is **not** a coherent model of this track's true geometry.
+This is a stronger result than round 3's "dead reckoning accumulates
+error" finding, because the cycle-consistency test uses local,
+non-accumulated evidence (four one-hop fits, not a walk around a large
+chain) and still fails -- ruling out not just "the fitting/chaining
+algorithm has bugs" but the basic shape of the model itself. Also
+tested: no correlation (all \|Pearson r\| < 0.1) between the fitted
+rotation and any of the candidate `heading`/`unk_1e`/`group_id`/etc.
+record fields, under both methodologies -- consistent with round 2's
+earlier exclusion of `heading` as a direct rotation value, now checked
+against real per-transition deltas too.
+
+Per the standing project rule, **no track geometry was wired into the
+Phase 3 rasterizer this round** (gated on a working transform, which
+this round did not produce). Honest next-round recommendation: a
+richer model is needed before trying rotation-fitting again -- most
+plausibly a continuous/per-record orientation (the road curves
+smoothly; one angle per whole section is too coarse) and/or a free
+translation offset within the grid cell rather than a literal
+corner-anchor. A "smarter" global least-squares/pose-graph optimization
+over the *same* single-rotation-per-section model is not expected to
+help, since the cycle test shows the underlying per-pair constraints
+are already mutually inconsistent at the local level, not just noisily
+chained over distance.
+
+Zero regressions: full build (`rr_pc_port`, `rr_pc_port_gpu_test`,
+`mapparse_tool`, `worldmap_tool`, `objparse_tool`) still clean,
+`ctest` still 1/1 pass. `tools/rotation_fit/` is pure-Python and not
+part of the CMake build, so it can't break the C build.
+
 ## Phase 6 -- Audio
 
 SPU emulation or a from-scratch replacement audio engine, once there's
