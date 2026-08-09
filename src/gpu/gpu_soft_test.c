@@ -167,6 +167,63 @@ int main(void) {
     expect_pixel(60, 60, 0x0012AB34, "quad center");
     expect_pixel(10, 10, 0x00000000, "outside the quad");
 
+    /* 9. gpu_draw_quad_textured: a small synthetic 4x4 checkerboard
+     * texture (alternating red/blue 2x2 quadrants, RGBA8888 packed the
+     * same way tools/texparse/tim.c's TIM_RGBA macro does -- R in the
+     * lowest byte -- without depending on tim.h, since gpu_soft stays
+     * dependency-free), mapped onto an axis-aligned square the same
+     * shape as the gpu_draw_quad_flat test above so UV<->screen space
+     * is easy to reason about by hand: u=[0,1] maps left-to-right,
+     * v=[0,1] maps top-to-bottom, exactly onto the quad's x/y range. */
+    gpu_clear(0x00000000);
+    {
+        /* clang-format off */
+        static const uint32_t checker[4 * 4] = {
+            /* row0: red | red | blue | blue */
+            0x000000FFu | (0xFFu << 24), 0x000000FFu | (0xFFu << 24), 0x00FF0000u | (0xFFu << 24), 0x00FF0000u | (0xFFu << 24),
+            0x000000FFu | (0xFFu << 24), 0x000000FFu | (0xFFu << 24), 0x00FF0000u | (0xFFu << 24), 0x00FF0000u | (0xFFu << 24),
+            0x00FF0000u | (0xFFu << 24), 0x00FF0000u | (0xFFu << 24), 0x000000FFu | (0xFFu << 24), 0x000000FFu | (0xFFu << 24),
+            0x00FF0000u | (0xFFu << 24), 0x00FF0000u | (0xFFu << 24), 0x000000FFu | (0xFFu << 24), 0x000000FFu | (0xFFu << 24),
+        };
+        /* clang-format on */
+        /* checker[] values above are TIM_RGBA(r,g,b,255) written out by
+         * hand: TIM_RGBA(255,0,0,255) (red) == 0x000000FFu|(0xFFu<<24)
+         * i.e. R=0xFF in the lowest byte; TIM_RGBA(0,0,255,255) (blue)
+         * == 0x00FF0000u|(0xFFu<<24) i.e. B=0xFF in the third byte. */
+        gpu_draw_quad_textured(30, 30, 0.0f, 0.0f,
+                                90, 30, 1.0f, 0.0f,
+                                90, 90, 1.0f, 1.0f,
+                                30, 90, 0.0f, 1.0f,
+                                checker, 4, 4);
+
+        /* Top-left quadrant of the checkerboard (u,v in [0,0.5)) is
+         * red -- sample well inside the top-left quarter of the quad. */
+        expect_pixel(45, 45, 0x00FF0000, "textured quad top-left quadrant (red)");
+        /* Top-right quadrant (u in [0.5,1), v in [0,0.5)) is blue. */
+        expect_pixel(75, 45, 0x000000FF, "textured quad top-right quadrant (blue)");
+        /* Bottom-left quadrant (u in [0,0.5), v in [0.5,1)) is blue. */
+        expect_pixel(45, 75, 0x000000FF, "textured quad bottom-left quadrant (blue)");
+        /* Bottom-right quadrant (u,v in [0.5,1)) is red. */
+        expect_pixel(75, 75, 0x00FF0000, "textured quad bottom-right quadrant (red)");
+        /* Outside the quad entirely: untouched by the draw call. */
+        expect_pixel(10, 10, 0x00000000, "outside the textured quad");
+    }
+
+    /* 10. gpu_draw_quad_textured with a fully-transparent texture
+     * (alpha==0 everywhere) must be a safe no-op -- proves the
+     * alpha==0 texels-skipped rule actually skips the framebuffer
+     * write rather than drawing black. */
+    gpu_clear(0x00123456);
+    {
+        static const uint32_t transparent[2 * 2] = {0, 0, 0, 0};
+        gpu_draw_quad_textured(20, 20, 0.0f, 0.0f,
+                                60, 20, 1.0f, 0.0f,
+                                60, 60, 1.0f, 1.0f,
+                                20, 60, 0.0f, 1.0f,
+                                transparent, 2, 2);
+        expect_pixel(40, 40, 0x00123456, "fully-transparent textured quad is a no-op");
+    }
+
     if (failures == 0) {
         printf("-- all gpu_soft sanity checks passed --\n");
         return 0;

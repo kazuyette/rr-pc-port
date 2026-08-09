@@ -59,4 +59,36 @@ void gpu_draw_quad_flat(int x0, int y0, int x1, int y1,
  * (x0==x1 && y0==y1) lines. */
 void gpu_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
 
+/* Texture-mapped quad, built from two triangles sharing the
+ * (x0,y0)-(x2,y2) diagonal, same vertex ordering convention as
+ * gpu_draw_quad_flat -- (v0,v1,v2) and (v0,v2,v3), vertices in order
+ * around the quad's perimeter.
+ *
+ * (u,v) are normalized texture coordinates in [0,1] per vertex,
+ * interpolated per-pixel with the same integer barycentric weights
+ * gpu_draw_triangle_gouraud uses for vertex colors (simple affine
+ * interpolation, NOT perspective-correct -- fine for this proof-of-
+ * concept, real PS1-accurate perspective correction is a later phase).
+ * Sampling is nearest-neighbor (no bilinear filtering).
+ *
+ * `texture_rgba` is a tex_w*tex_h array of RGBA8888 texels packed as
+ * TIM_RGBA(r,g,b,a) (see tools/texparse/tim.h) -- R in the lowest
+ * byte. This module doesn't depend on tim.h/tim.c (stays dependency-
+ * free like the rest of gpu_soft), so the packing is just documented
+ * here to match; any RGBA8888 buffer in that byte order works,
+ * texture decoding is entirely the caller's concern.
+ *
+ * Texels with alpha == 0 are skipped (not written to the framebuffer)
+ * -- simple binary transparency, matching TIM's occasional "raw 0x0000
+ * == transparent" convention if a caller chooses to encode it that
+ * way; texels with alpha > 0 are drawn fully opaque (no blending),
+ * consistent with this rasterizer having no alpha-blend support
+ * elsewhere. Out-of-range UV coordinates are clamped to the texture's
+ * valid pixel range rather than wrapping or sampling out of bounds. */
+void gpu_draw_quad_textured(int x0, int y0, float u0, float v0,
+                             int x1, int y1, float u1, float v1,
+                             int x2, int y2, float u2, float v2,
+                             int x3, int y3, float u3, float v3,
+                             const uint32_t *texture_rgba, int tex_w, int tex_h);
+
 #endif /* RR_PC_PORT_GPU_SOFT_H */

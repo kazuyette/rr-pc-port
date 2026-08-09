@@ -3,6 +3,8 @@
  */
 #include "gpu_soft.h"
 
+#include <stddef.h>
+
 uint32_t gpu_framebuffer[GPU_FB_WIDTH * GPU_FB_HEIGHT];
 
 void gpu_clear(uint32_t color) {
@@ -151,6 +153,91 @@ void gpu_draw_quad_flat(int x0, int y0, int x1, int y1,
                          uint32_t color) {
     gpu_draw_triangle_flat(x0, y0, x1, y1, x2, y2, color);
     gpu_draw_triangle_flat(x0, y0, x2, y2, x3, y3, color);
+}
+
+/* Internal helper: one texture-mapped triangle, same scanline/edge-
+ * function structure as gpu_draw_triangle_gouraud but interpolating
+ * (u,v) instead of a color, then nearest-neighbor sampling
+ * texture_rgba at each covered pixel. See gpu_draw_quad_textured's doc
+ * comment in gpu_soft.h for the exact semantics (affine interpolation,
+ * alpha==0 texels skipped, UV clamped to the texture's valid range). */
+static void gpu_draw_triangle_textured(int x0, int y0, float u0, float v0,
+                                        int x1, int y1, float u1, float v1,
+                                        int x2, int y2, float u2, float v2,
+                                        const uint32_t *texture_rgba, int tex_w, int tex_h) {
+    int minx, maxx, miny, maxy;
+    int area;
+    int x, y;
+
+    if (texture_rgba == NULL || tex_w <= 0 || tex_h <= 0) {
+        return;
+    }
+
+    minx = min3(x0, x1, x2);
+    maxx = max3(x0, x1, x2);
+    miny = min3(y0, y1, y2);
+    maxy = max3(y0, y1, y2);
+
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > GPU_FB_WIDTH - 1) maxx = GPU_FB_WIDTH - 1;
+    if (maxy > GPU_FB_HEIGHT - 1) maxy = GPU_FB_HEIGHT - 1;
+
+    area = edge_fn(x0, y0, x1, y1, x2, y2);
+    if (area == 0) {
+        return; /* degenerate (zero-area) triangle, nothing to draw */
+    }
+
+    for (y = miny; y <= maxy; y++) {
+        for (x = minx; x <= maxx; x++) {
+            int px = x, py = y;
+            int w0 = edge_fn(x1, y1, x2, y2, px, py);
+            int w1 = edge_fn(x2, y2, x0, y0, px, py);
+            int w2 = edge_fn(x0, y0, x1, y1, px, py);
+
+            int inside;
+            if (area > 0) {
+                inside = (w0 >= 0) && (w1 >= 0) && (w2 >= 0);
+            } else {
+                inside = (w0 <= 0) && (w1 <= 0) && (w2 <= 0);
+            }
+
+            if (inside) {
+                float bw0 = (float)w0 / (float)area;
+                float bw1 = (float)w1 / (float)area;
+                float bw2 = (float)w2 / (float)area;
+                float u = u0 * bw0 + u1 * bw1 + u2 * bw2;
+                float v = v0 * bw0 + v1 * bw1 + v2 * bw2;
+                int tx = (int)(u * (float)tex_w);
+                int ty = (int)(v * (float)tex_h);
+                uint32_t texel;
+
+                if (tx < 0) tx = 0;
+                if (tx > tex_w - 1) tx = tex_w - 1;
+                if (ty < 0) ty = 0;
+                if (ty > tex_h - 1) ty = tex_h - 1;
+
+                texel = texture_rgba[(size_t)ty * (size_t)tex_w + (size_t)tx];
+                if ((texel >> 24) != 0) { /* alpha != 0 */
+                    int r = (int)(texel & 0xFF);
+                    int g = (int)((texel >> 8) & 0xFF);
+                    int b = (int)((texel >> 16) & 0xFF);
+                    gpu_framebuffer[y * GPU_FB_WIDTH + x] = pack_rgb(r, g, b);
+                }
+            }
+        }
+    }
+}
+
+void gpu_draw_quad_textured(int x0, int y0, float u0, float v0,
+                             int x1, int y1, float u1, float v1,
+                             int x2, int y2, float u2, float v2,
+                             int x3, int y3, float u3, float v3,
+                             const uint32_t *texture_rgba, int tex_w, int tex_h) {
+    gpu_draw_triangle_textured(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
+                                texture_rgba, tex_w, tex_h);
+    gpu_draw_triangle_textured(x0, y0, u0, v0, x2, y2, u2, v2, x3, y3, u3, v3,
+                                texture_rgba, tex_w, tex_h);
 }
 
 void gpu_draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
