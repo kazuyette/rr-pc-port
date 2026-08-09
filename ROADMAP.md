@@ -117,23 +117,80 @@ something recognizable to an SDL2 texture/window.
   phase 5 to eventually fill `gpu_framebuffer` from real geometry
   instead of hardcoded shapes.
 
+### Phase 3, milestone 2 -- DONE: gouraud shading, lines, quad helper, animated demo scene
+
+A lighter, direct-coding round (deliberately not track-format RE work):
+extended `gpu_soft` with the primitive types milestone 1 deferred, and
+made the demo scene actually move instead of sitting static.
+
+- **`gpu_draw_triangle_gouraud(x0,y0,x1,y1,x2,y2, color0,color1,color2)`**
+  (`src/gpu/gpu_soft.h`/`.c`): per-vertex packed 0x00RRGGBB color,
+  linearly interpolated per-pixel via the same barycentric
+  edge-function weights `gpu_draw_triangle_flat` already computes for
+  its inside test (`w0/area`, `w1/area`, `w2/area` are the actual
+  barycentric coordinates for vertices 0/1/2; blend each RGB channel
+  by those weights, integer math throughout). Same scanline structure,
+  same degenerate-triangle no-op behavior, as the flat version -- a
+  real PS1 POLY_G3/G4-shaped primitive, not a demo-only shortcut.
+- **`gpu_draw_line(x0,y0,x1,y1,color)`**: standard integer Bresenham,
+  handles all octants plus the horizontal/vertical/single-point edge
+  cases (matches the PS1 GPU's LINE_F2 primitive).
+- **`gpu_draw_quad_flat(x0,y0,x1,y1,x2,y2,x3,y3,color)`**: thin wrapper
+  around two `gpu_draw_triangle_flat` calls sharing the (v0,v2)
+  diagonal -- groundwork for wiring in real MAP.RRM road quads later,
+  since that record format is quad-shaped per-section geometry.
+- **Animated demo scene** (`src/main.c`'s `draw_animated_scene`,
+  replacing the old static `draw_hardcoded_scene`): a gouraud-shaded
+  triangle orbits and spins around the screen center (`SDL_GetTicks()`-
+  driven angle, per-vertex colors cycling via a phase-offset cosine
+  blend so the shading itself animates, not just the position); the
+  original two flat corner triangles are unchanged in shape but now
+  gently pulse in size (scaled from their own centroid) and color-cycle
+  instead of sitting static, proving `gpu_draw_triangle_flat` still
+  works unmodified; a faint background grid and a center crosshair
+  exercise `gpu_draw_line`. Everything derives from a single
+  `now_ms` time source passed in from the SDL loop so it all stays in
+  sync. The window-stays-open-until-closed/Escape behavior and the
+  headless/CI 2-second safety cap (`SDL_VIDEODRIVER=dummy`) are both
+  unchanged.
+- `src/gpu/gpu_soft_test.c`: extended with gouraud-triangle checks
+  (near-vertex dominant-channel checks with a small tolerance rather
+  than exact color, since barycentric weight isn't exactly 1 one pixel
+  off a vertex; an even-blend midpoint check; degenerate-gouraud
+  no-op), line checks (horizontal/vertical/45-degree endpoints +
+  midpoints, a just-off-the-line negative check, and a single-point
+  line producing exactly one pixel with no infinite loop), and quad
+  checks (all four corners plus center filled, outside untouched).
+  Still fully headless, no display needed, still wired into `ctest`
+  (`gpu_soft_sanity`) alongside the original flat-triangle checks,
+  which are unchanged and still pass. `CMakeLists.txt` now also links
+  `libm` for `rr_pc_port` (the animated scene's `sin`/`cos` calls),
+  found via `find_library` so it's a no-op on platforms where math
+  functions are already part of libc.
+- Verified in this sandbox (no SDL2 dev headers available here, same
+  as milestone 1): the headless `rr_pc_port`/`rr_pc_port_gpu_test`
+  build clean under `-Wall -Wextra` with zero warnings, `ctest` passes,
+  and all 63 previously-ported Phase 1/2 logic functions still produce
+  their expected outputs. The `HAVE_SDL2` code path (including the new
+  `draw_animated_scene`) was additionally syntax- and runtime-checked
+  by compiling/linking `src/main.c` against a minimal stand-in SDL2
+  header + stub implementation reproducing the same call sequence a
+  real SDL2 would make (including a "window open, ticking forward"
+  stub that actually executes `draw_animated_scene` every frame) --
+  it compiles warning-free and runs to a clean exit with no crash. This
+  is not a substitute for testing against real SDL2 (the user's WSL
+  build is the real verification), just extra confidence given this
+  sandbox has no SDL2 dev package available.
+
 ### Phase 3, still to do
 
-- **Gouraud-shaded triangles**: per-vertex color + interpolation
-  (barycentric weights already computed in `gpu_draw_triangle_flat`,
-  extending to `gpu_draw_triangle_gouraud` with 3 colors is the natural
-  next step).
 - **Textured polygons**: UV coordinates per vertex, a texture/CLUT
   sampling model matching the PS1 GPU's 4/8/16-bit texture page +
   palette system (this needs Phase 5's TEX asset loading to have
   anything real to sample from -- a checkerboard/solid placeholder
   texture is enough to prove the sampling code path first).
-- **Quads and sprites**: the PS1 GPU natively submits flat/gouraud
-  quads (two triangles) and sprites (axis-aligned rects, often with a
-  fixed size); wrap `gpu_draw_triangle_flat`/`_gouraud` rather than
-  duplicating the fill loop.
-- **Lines**: simple Bresenham, lower priority (mostly used for debug
-  overlays and a few UI elements, not core track/car rendering).
+- **Sprites**: axis-aligned rects, often with a fixed size; likely
+  another thin wrapper, same spirit as `gpu_draw_quad_flat`.
 - **A `psx_bios.h` `PsxBios_GpuSubmit`-shaped entry point** that
   receives PS1-style GPU primitive packets (the actual on-disc/RAM
   packet layout the game code builds and submits, once traced from

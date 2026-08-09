@@ -85,3 +85,12 @@ if(SDL2_FOUND)
 else()
   message(STATUS "rr-pc-port: SDL2 NOT found, building headless (logic-only) binary")
 endif()
+
+# Phase 3 animated demo scene (src/main.c) uses <math.h> (sin/cos) for
+# the rotating/pulsing shapes -- link libm where it's a separate library
+# (Linux/WSL); on platforms where it's already part of libc (e.g. MSVC)
+# find_library just won't find a separate one and this is a no-op.
+find_library(RR_PC_PORT_MATH_LIBRARY m)
+if(RR_PC_PORT_MATH_LIBRARY)
+  target_link_libraries(rr_pc_port PRIVATE ${RR_PC_PORT_MATH_LIBRARY})
+endif()
