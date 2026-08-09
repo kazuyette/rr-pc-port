@@ -291,6 +291,71 @@ per-object pointer field to decode the actual object data format; (3)
 once the transform is solid, wire real track geometry into the phase-3
 rasterizer.
 
+### Phase 5, round 3 -- rotation hunt: 3 more hypotheses ruled out + GTE render-time rotation confirmed; OBJ.RRO ptr_field re-characterized
+
+**Rotation still NOT decoded from the file, but the search space is now
+much smaller and one important new fact is nailed down.** Four things
+tried this round (full reasoning + numbers in `idx_hed.h`'s header
+comment and project memory):
+
+1. Re-checked IDX.HED cell values across all 258 occupied cells for
+   packed bits beyond a plain section index -- **ruled out**, zero
+   stray high bits found, no room for orientation data there.
+2. Re-checked MAP.RRM's `count_d` across all 258 directory entries (not
+   a sample) -- still 0 everywhere, and since `count_a/b/c`'s
+   arithmetic already accounts for the file's exact size with zero
+   slack, there is no room to hide a rotation field in that 8-byte
+   directory entry either -- **ruled out**.
+3. A new pure-geometry "dead reckoning" chain solve: derive each
+   section's rotation+translation purely from matching its first
+   record's entry edge to the previous section's last record's exit
+   edge (both edge orientations tried), propagated around the full
+   258-section loop -- **ruled out**. The loop failed to close by
+   42,000-88,000 world units (the whole track only spans ~65,536
+   units), and per-transition heading deltas were essentially random.
+   Sanity check confirmed *within*-section record chaining (no
+   transform) DOES work cleanly, so the problem is specifically that
+   "last record of section i / first record of section i+1" isn't a
+   reliable join point in general -- likely because the large
+   multi-record sections (9-12, with 36-69 records each) are branching
+   clusters, not simple paths.
+4. **New confirmed fact**: traced the render-time consumer of the
+   MAP.RRM section table (`func_80035638`) into its helper functions
+   `func_8004006C`/`func_80040140` and confirmed, instruction-by-
+   instruction, that they execute real PS1 GTE `rtps`/`rtpt` hardware
+   perspective-transform instructions with a `ctc2`-loaded rotation
+   matrix. **Rotation genuinely is applied via a hardware matrix
+   multiply at render time**, not stored in the file -- but the trace
+   didn't reach the call site that actually *constructs* a fresh
+   per-section matrix (two nearby functions checked, `func_80043738`/
+   `func_80043794`, turned out to only sign-flip/mirror the
+   already-loaded matrix, not build a new one). Concrete next-round
+   lead: find every `ctc2` write into GTE control regs 0-4 and trace
+   its source value backward.
+
+**OBJ.RRO**: the "ptr_field" directory column (previously "0 or a small
+placeholder") is now known to split cleanly into 3 buckets on the real
+file -- 137 zero, 142 small integers (1-1000), and 40 that are all
+(100%, exhaustively checked) within a small tolerance of an exact
+multiple of 65536, i.e. plausibly 16.16 fixed-point small integers
+(1, 4, 5, 7, 8, 16, 29 observed) -- not simple padding after all,
+though still write-only from `func_80012670`'s perspective (no
+consumer traced yet). Also corrected an overstated claim from last
+round: the trailing unaccounted region's 0x0FFF-sentinel frequency
+(0.404%) is actually comparable to the already-accounted region's
+(0.634%), not a distinguishing signature -- the trailing region is
+still clearly structured data (period-6-byte local repetition
+consistent with 3x int16 vectors), just not decoded exactly. Both new
+analyses are runnable, verifiable stats (no raw game bytes committed)
+added to `objparse_tool`.
+
+Zero regressions: full build (`rr_pc_port`, `rr_pc_port_gpu_test`,
+`mapparse_tool`, `worldmap_tool`, `objparse_tool`) still clean under
+`-Wall -Wextra`, `ctest` still 1/1 pass, `worldmap_tool` still reports
+"sections placed: 258 of 258". No rasterizer wiring this round --
+correctly held back per the standing rule of only wiring in a
+validated transform, and the transform is still incomplete.
+
 ## Phase 6 -- Audio
 
 SPU emulation or a from-scratch replacement audio engine, once there's
