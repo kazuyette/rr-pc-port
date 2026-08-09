@@ -34,4 +34,29 @@ void gpu_clear(uint32_t color);
 void gpu_draw_triangle_flat(int x0, int y0, int x1, int y1, int x2, int y2,
                              uint32_t color);
 
+/* Gouraud-shaded triangle: one packed 0x00RRGGBB color per vertex,
+ * linearly interpolated per-pixel across the triangle interior using
+ * the same barycentric edge-function weights gpu_draw_triangle_flat
+ * uses for its inside test. This is a real PS1 GPU primitive type
+ * (the hardware natively draws gouraud-shaded polygons), not a demo
+ * gimmick -- the eventual GPU-packet dispatcher routes straight here
+ * for POLY_G3/G4 packets. */
+void gpu_draw_triangle_gouraud(int x0, int y0, int x1, int y1, int x2, int y2,
+                                uint32_t color0, uint32_t color1, uint32_t color2);
+
+/* Flat-shaded quad, built from two triangles sharing the (x0,y0)-(x2,y2)
+ * diagonal: (v0,v1,v2) and (v0,v2,v3). Vertices are expected in order
+ * around the quad's perimeter (matches the PS1 GPU's POLY_F4 packet
+ * shape) -- useful groundwork for wiring in real MAP.RRM road quads
+ * later, since that record format is quad-shaped per-section geometry. */
+void gpu_draw_quad_flat(int x0, int y0, int x1, int y1,
+                         int x2, int y2, int x3, int y3,
+                         uint32_t color);
+
+/* Single-pixel line from (x0,y0) to (x1,y1), integer Bresenham --
+ * matches the PS1 GPU's flat-shaded LINE_F2 primitive. Handles all
+ * octants/slopes including vertical, horizontal, and single-point
+ * (x0==x1 && y0==y1) lines. */
+void gpu_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
+
 #endif /* RR_PC_PORT_GPU_SOFT_H */
