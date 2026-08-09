@@ -1,4 +1,4 @@
-/* rr-pc-port -- phase 1 + 2 + 3 vertical slice.
+/* rr-pc-port -- phase 1 + 2 + 3 vertical slice, + real-texture demo.
  *
  * Proves these things compile and run together on a normal host:
  *   1. Genuine ported decomp logic (src/globals.c, src/stubs.c,
@@ -13,9 +13,20 @@
  *      crosshair via gpu_draw_line) into a raw framebuffer, blitted to
  *      the SDL2 window each frame via a streaming texture. Hardcoded
  *      shapes only -- no real game geometry yet, that's phase 5.
+ *   4. Real-texture demo mode: if invoked with a path to one of the
+ *      game's own TEX*.TMS files (argv[1]), decodes it via
+ *      tools/texparse/tim.c and displays one of its real pages as a
+ *      large centered quad via gpu_draw_quad_textured -- proof that
+ *      authentic game art, not just synthetic shapes, can flow through
+ *      this rasterizer. Entirely additive/optional: with no argv[1],
+ *      behavior is unchanged from the phase 1-3 animated demo above.
+ *      The TEX*.TMS file itself is never bundled/committed -- point
+ *      this at your own local extraction, e.g.:
+ *        ./rr_pc_port /path/to/TEX0.TMS
  *
  * This is scaffolding -- no asm-locked function, no audio, no real
- * geometry/textures. See ROADMAP.md.
+ * geometry yet (real textures now flow through, real MAP.RRM/OBJ.RRO
+ * geometry is still phase 5). See ROADMAP.md.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +39,7 @@
 #include "ported.h"
 #include "ported_logic.h"
 #include "gpu/gpu_soft.h"
+#include "tim.h"
 
 #ifdef HAVE_SDL2
 #include <SDL2/SDL.h>
@@ -95,6 +107,114 @@ static void exercise_ported_logic_round1(void) {
     printf("func_80047D24: rc=%d cnt[3]=%d word=0x%X (expect 0, 6, 0)\n", rc, cnt[3], word);
 
     printf("-- phase 2 round 1 ported logic OK --\n");
+}
+
+/* Reads a whole file into a malloc'd buffer, same small helper pattern
+ * as tools/mapparse/mapparse_main.c and tools/texparse/texparse_main.c
+ * (kept as its own copy here rather than shared, to keep main.c's
+ * build free of any extra tools/-only source files beyond tim.c
+ * itself). Returns NULL and prints a diagnostic on any failure. */
+static uint8_t *read_whole_file(const char *path, size_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    long size;
+    uint8_t *buf;
+    size_t read_bytes;
+
+    if (f == NULL) {
+        printf("could not open '%s'\n", path);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        printf("fseek failed on '%s'\n", path);
+        fclose(f);
+        return NULL;
+    }
+    size = ftell(f);
+    if (size <= 0) {
+        printf("ftell failed (or empty file) on '%s'\n", path);
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+
+    buf = (uint8_t *)malloc((size_t)size);
+    if (buf == NULL) {
+        printf("out of memory reading '%s' (%ld bytes)\n", path, size);
+        fclose(f);
+        return NULL;
+    }
+    read_bytes = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (read_bytes != (size_t)size) {
+        printf("short read on '%s' (%zu of %ld bytes)\n", path, read_bytes, size);
+        free(buf);
+        return NULL;
+    }
+    *out_size = (size_t)size;
+    return buf;
+}
+
+/* Loads a TEX*.TMS file at `path` and picks the first page that
+ * actually decoded to real pixel data and is a reasonable size (skips
+ * degenerate/tiny/undecoded pages -- e.g. mode-3/24bpp pages this
+ * parser doesn't decode, or pages too small to be interesting on
+ * screen). On success returns 1 and sets *tf_out (caller must
+ * tim_free() it later) and *page_out to a pointer INTO *tf_out's
+ * pages array (valid as long as *tf_out is alive). On failure returns
+ * 0 and leaves *tf_out zeroed. */
+static int load_demo_texture_page(const char *path, TimFile *tf_out, const TimPage **page_out) {
+    uint8_t *buf;
+    size_t buf_size;
+    size_t i;
+
+    memset(tf_out, 0, sizeof(*tf_out));
+    *page_out = NULL;
+
+    buf = read_whole_file(path, &buf_size);
+    if (buf == NULL) {
+        return 0;
+    }
+
+    if (tim_parse(buf, buf_size, tf_out) != TIM_OK) {
+        printf("tim_parse failed on '%s'\n", path);
+        free(buf);
+        return 0;
+    }
+    free(buf); /* tim_parse copies out everything it needs into tf_out */
+
+    for (i = 0; i < tf_out->page_count; i++) {
+        const TimPage *p = &tf_out->pages[i];
+        if (p->rgba != NULL && p->width >= 8 && p->height >= 8) {
+            *page_out = p;
+            printf("texture demo: using page %zu of '%s' (%dx%d, vram=(%d,%d)), %zu pages total in file\n",
+                   i, path, p->width, p->height, p->vram_x, p->vram_y, tf_out->page_count);
+            return 1;
+        }
+    }
+
+    printf("texture demo: no usable (>=8x8, decoded) page found in '%s' (%zu pages total)\n",
+           path, tf_out->page_count);
+    return 0;
+}
+
+/* Renders one real, decoded TIM page as a large centered quad -- the
+ * proof-of-concept: authentic game texture art, not a synthetic shape,
+ * flowing through gpu_draw_quad_textured() into the same framebuffer
+ * the animated demo scene uses. Static (no animation) -- the point is
+ * showing the real art clearly, not motion. */
+static void draw_texture_demo_scene(const TimPage *page) {
+    int margin = 8;
+    int x0 = margin, y0 = margin;
+    int x1 = GPU_FB_WIDTH - 1 - margin, y1 = margin;
+    int x2 = GPU_FB_WIDTH - 1 - margin, y2 = GPU_FB_HEIGHT - 1 - margin;
+    int x3 = margin, y3 = GPU_FB_HEIGHT - 1 - margin;
+
+    gpu_clear(0x00181818); /* neutral dark gray so texture colors read true */
+    gpu_draw_quad_textured(x0, y0, 0.0f, 0.0f,
+                            x1, y1, 1.0f, 0.0f,
+                            x2, y2, 1.0f, 1.0f,
+                            x3, y3, 0.0f, 1.0f,
+                            page->rgba, page->width, page->height);
 }
 
 #ifdef HAVE_SDL2
@@ -201,14 +321,22 @@ static void draw_animated_scene(Uint32 now_ms) {
     }
 }
 
-static int run_sdl_loop(void) {
+/* `tex_page` selects which scene the loop draws every frame: NULL runs
+ * the original phase 1-3 animated demo unchanged; non-NULL switches to
+ * the static real-texture demo (draw_texture_demo_scene) instead, and
+ * the window title reflects which mode is active. */
+static int run_sdl_loop(const TimPage *tex_page) {
+    const char *title = (tex_page != NULL)
+        ? "rr-pc-port (real texture demo -- decoded from a TEX*.TMS file)"
+        : "rr-pc-port (phase 3 -- software rasterizer)";
+
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         printf("SDL_Init failed (%s) -- continuing headless\n", SDL_GetError());
         return 1;
     }
 
     SDL_Window *window = SDL_CreateWindow(
-        "rr-pc-port (phase 3 -- software rasterizer)",
+        title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         640, 480, SDL_WINDOW_SHOWN);
 
@@ -262,7 +390,11 @@ static int run_sdl_loop(void) {
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
         }
 
-        draw_animated_scene(SDL_GetTicks() - start);
+        if (tex_page != NULL) {
+            draw_texture_demo_scene(tex_page);
+        } else {
+            draw_animated_scene(SDL_GetTicks() - start);
+        }
         SDL_UpdateTexture(fb_texture, NULL, gpu_framebuffer,
                            GPU_FB_WIDTH * (int)sizeof(uint32_t));
 
@@ -283,19 +415,59 @@ static int run_sdl_loop(void) {
 }
 #endif
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* Optional real-texture demo mode: `rr_pc_port /path/to/TEX0.TMS`.
+     * With no argument, behavior is exactly the original phase 1-3
+     * animated demo -- this is purely additive. See the file header
+     * comment and load_demo_texture_page()/draw_texture_demo_scene()
+     * above for what this does. */
+    const char *tex_path = (argc > 1) ? argv[1] : NULL;
+    TimFile tex_file;
+    const TimPage *tex_page = NULL;
+
+    memset(&tex_file, 0, sizeof(tex_file));
+
     printf("rr-pc-port phase 1+2+3 vertical slice\n");
 
     exercise_ported_functions();
     exercise_ported_logic_round1();
 
+    if (tex_path != NULL) {
+        printf("-- texture demo mode: loading '%s' --\n", tex_path);
+        load_demo_texture_page(tex_path, &tex_file, &tex_page);
+        /* On failure, tex_page stays NULL -- falls back to the animated
+         * demo below rather than crashing or exiting, so a bad path
+         * doesn't break the rest of the vertical slice. */
+    }
+
 #ifdef HAVE_SDL2
-    if (run_sdl_loop() != 0) {
+    if (run_sdl_loop(tex_page) != 0) {
         printf("(no usable display -- window/event loop skipped, logic-only run)\n");
     }
 #else
-    printf("(built without SDL2 -- window/event loop skipped, logic-only run)\n");
+    if (tex_page != NULL) {
+        /* No SDL2 at build time -- still prove the decode -> rasterize
+         * pipeline works headlessly, same check
+         * rr_pc_port_texdemo_test automates: draw the real page into
+         * gpu_framebuffer[] and report whether it shows real variation. */
+        int px, distinct = 0;
+        uint32_t first;
+        draw_texture_demo_scene(tex_page);
+        first = gpu_framebuffer[0];
+        for (px = 0; px < GPU_FB_WIDTH * GPU_FB_HEIGHT; px++) {
+            if (gpu_framebuffer[px] != first) { distinct = 1; break; }
+        }
+        printf("(built without SDL2 -- headless texture demo: drew %dx%d page into "
+               "gpu_framebuffer[], %s)\n",
+               tex_page->width, tex_page->height,
+               distinct ? "framebuffer shows real variation (not solid color)"
+                        : "WARNING: framebuffer is a single solid color");
+    } else {
+        printf("(built without SDL2 -- window/event loop skipped, logic-only run)\n");
+    }
 #endif
+
+    tim_free(&tex_file);
 
     printf("phase 1+2+3 vertical slice complete, exiting 0\n");
     return 0;
