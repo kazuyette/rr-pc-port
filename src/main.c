@@ -471,9 +471,30 @@ static void track_view_build_autopilot_path(const TrackDemo *td) {
 
 /* Advances the camera along the autopilot path by `dt` seconds. No-op
  * if autopilot is off or the path hasn't been built yet. */
+/* Returns waypoint index `i` modulo the (looped) waypoint count,
+ * handling negative `i` correctly (needed for the Catmull-Rom "point
+ * before the segment start" sample). */
+static int autopilot_wp_index(int i) {
+    int n = s_autopilot_wp_count;
+    int m = i % n;
+    if (m < 0) m += n;
+    return m;
+}
+
+/* Catmull-Rom spline through the looped waypoint list -- round 12
+ * originally used a straight lerp between consecutive waypoints, which
+ * visibly cuts corners where waypoints are sparse (round-10 style
+ * section spacing is uneven). This is a drop-in smoother replacement:
+ * same waypoint data, same `s_autopilot_t` progress variable, just a
+ * curved path through the same points instead of straight segments
+ * between them, plus the analytic tangent for a smoothly-turning
+ * facing direction instead of a per-segment constant heading. */
 static void track_view_autopilot_update(double dt) {
-    int i0, i1;
-    double frac, x0, z0, x1, z1, dx, dz;
+    int i0, i1, im1, i2;
+    double t, t2, t3;
+    double p_m1x, p0x, p1x, p2x;
+    double p_m1z, p0z, p1z, p2z;
+    double dx, dz;
 
     if (!s_autopilot_on || s_autopilot_wp_count < 2) return;
 
@@ -481,17 +502,36 @@ static void track_view_autopilot_update(double dt) {
     while (s_autopilot_t >= (double)s_autopilot_wp_count) s_autopilot_t -= (double)s_autopilot_wp_count;
 
     i0 = (int)s_autopilot_t;
-    i1 = (i0 + 1) % s_autopilot_wp_count;
-    frac = s_autopilot_t - (double)i0;
+    t = s_autopilot_t - (double)i0;
+    im1 = autopilot_wp_index(i0 - 1);
+    i1 = autopilot_wp_index(i0 + 1);
+    i2 = autopilot_wp_index(i0 + 2);
 
-    x0 = s_autopilot_wp_x[i0]; z0 = s_autopilot_wp_z[i0];
-    x1 = s_autopilot_wp_x[i1]; z1 = s_autopilot_wp_z[i1];
+    p_m1x = s_autopilot_wp_x[im1]; p_m1z = s_autopilot_wp_z[im1];
+    p0x = s_autopilot_wp_x[i0];    p0z = s_autopilot_wp_z[i0];
+    p1x = s_autopilot_wp_x[i1];    p1z = s_autopilot_wp_z[i1];
+    p2x = s_autopilot_wp_x[i2];    p2z = s_autopilot_wp_z[i2];
 
-    s_cam_x = x0 + (x1 - x0) * frac;
-    s_cam_z = z0 + (z1 - z0) * frac;
+    t2 = t * t;
+    t3 = t2 * t;
 
-    dx = x1 - x0;
-    dz = z1 - z0;
+    /* Standard centripetal-free (uniform) Catmull-Rom position: */
+    s_cam_x = 0.5 * ((2.0 * p0x) + (-p_m1x + p1x) * t +
+                      (2.0 * p_m1x - 5.0 * p0x + 4.0 * p1x - p2x) * t2 +
+                      (-p_m1x + 3.0 * p0x - 3.0 * p1x + p2x) * t3);
+    s_cam_z = 0.5 * ((2.0 * p0z) + (-p_m1z + p1z) * t +
+                      (2.0 * p_m1z - 5.0 * p0z + 4.0 * p1z - p2z) * t2 +
+                      (-p_m1z + 3.0 * p0z - 3.0 * p1z + p2z) * t3);
+
+    /* Analytic derivative (tangent) at the same t -- gives a smoothly
+     * rotating facing direction along the curve instead of a heading
+     * that snaps at each waypoint. */
+    dx = 0.5 * ((-p_m1x + p1x) +
+                2.0 * (2.0 * p_m1x - 5.0 * p0x + 4.0 * p1x - p2x) * t +
+                3.0 * (-p_m1x + 3.0 * p0x - 3.0 * p1x + p2x) * t2);
+    dz = 0.5 * ((-p_m1z + p1z) +
+                2.0 * (2.0 * p_m1z - 5.0 * p0z + 4.0 * p1z - p2z) * t +
+                3.0 * (-p_m1z + 3.0 * p0z - 3.0 * p1z + p2z) * t2);
     if (dx != 0.0 || dz != 0.0) {
         s_cam_yaw = atan2(dx, dz); /* matches this file's yaw convention: forward = (sin(yaw), cos(yaw)) */
     }
