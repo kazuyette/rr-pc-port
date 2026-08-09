@@ -16,9 +16,11 @@ add_executable(rr_pc_port
   src/psx_compat/psx_bios.c
   src/gpu/gpu_soft.c
   tools/texparse/tim.c
+  tools/mapparse/map_rrm.c
+  tools/mapparse/idx_hed.c
 )
 
-target_include_directories(rr_pc_port PRIVATE src tools/texparse)
+target_include_directories(rr_pc_port PRIVATE src tools/texparse tools/mapparse)
 target_compile_options(rr_pc_port PRIVATE -Wall -Wextra)
 
 # Phase 3: headless sanity check for the software rasterizer, no SDL
