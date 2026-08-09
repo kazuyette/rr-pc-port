@@ -94,6 +94,44 @@
  * parse (count + per-entry raw fields + computed size), not a made-up
  * "full" object struct, so the parser can't be mistaken for more than
  * it actually is.
+ *
+ * ============================================================
+ * Phase 5 round 3 additions (see objparse_main.c for the runnable
+ * verification of both points below, computed from the user's own
+ * file at runtime -- no raw bytes committed to this repo):
+ *
+ * 1. The pre-overwrite "ptr_field" directory column (offset 0-3,
+ *    described above as "0 or a small placeholder for ~57% of
+ *    entries") turns out to have MORE structure than previously
+ *    characterized: of the real file's 319 entries, 137 are exactly 0,
+ *    142 are small positive integers (1..1000), and the remaining 40
+ *    are ALL (100% of that bucket, exhaustively checked) within a
+ *    small tolerance of an exact multiple of 65536 -- e.g. the
+ *    previously-noted "large" outlier 0x1D0140 is 29*65536 + 320,
+ *    i.e. almost exactly 29.0049 in 16.16 fixed-point. This strongly
+ *    suggests this field is NOT simple padding: it's plausibly a
+ *    16.16 fixed-point small-integer value (LOD level? a scale
+ *    factor? a category id?) for a specific subset of ~12.5% of
+ *    objects, coexisting with plain small integers for everything
+ *    else. NOT confirmed (no consumer function traced for this field
+ *    this round either -- it remains write-only from
+ *    func_80012670's perspective, same caveat as before), but a
+ *    genuinely new, more precise lead than "placeholder, unclear".
+ * 2. CORRECTION to a previous-round claim: last round's notes said the
+ *    trailing (unaccounted) region's hex dump showed "0x0FFF sentinel
+ *    values" as if that were a signature distinguishing it from the
+ *    already-accounted per-object data blobs. Measured exhaustively
+ *    this round (every int16 in both regions, not a hex-dump glance):
+ *    accounted region 0.634% of int16s == 0x0FFF, trailing region
+ *    0.404% -- comparable order of magnitude, NOT a useful
+ *    distinguishing signature. The trailing region IS still clearly
+ *    structured/non-random data (dense small-magnitude int16s, and a
+ *    strong local period-6-byte repetition pattern in the 0x0FFF
+ *    occurrence gaps, consistent with runs of 3x int16 vectors -- the
+ *    same "vector" shape MAP.RRM's records use), just not distinguishable
+ *    from the accounted region by this particular test. Exact record
+ *    boundaries/typing of the trailing region are still NOT decoded.
+ * ============================================================
  */
 #ifndef RR_OBJ_RRO_H
 #define RR_OBJ_RRO_H

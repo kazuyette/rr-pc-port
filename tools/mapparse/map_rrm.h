@@ -85,6 +85,19 @@
  * breakdown is provided as the best available decode of the 40 bytes,
  * clearly marked where uncertain, so a future round has a concrete
  * starting struct to refine rather than starting from raw hex again.
+ *
+ * Phase 5 round 3: re-verified count_d == 0 across ALL 258 directory
+ * entries (exhaustive, not a sample) -- still no exception found, and
+ * since count_a/count_b/count_c's arithmetic already accounts for the
+ * file's exact byte size with zero slack, there is no room left in
+ * this 8-byte directory entry to hide a rotation/orientation field
+ * without breaking that confirmed accounting. See idx_hed.h for the
+ * fuller rotation-hunt writeup (multiple new hypotheses tried and
+ * ruled out this round, plus one genuinely new confirmed fact: the PS1
+ * renderer DOES apply a real GTE hardware rotation matrix at render
+ * time via `rtps`/`rtpt`, traced instruction-by-instruction -- so
+ * rotation is real and applied dynamically, just not decoded from the
+ * file alone yet).
  */
 #ifndef RR_MAP_RRM_H
 #define RR_MAP_RRM_H

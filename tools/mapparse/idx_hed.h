@@ -77,6 +77,80 @@
  * Net effect: this file gives a WORKING (if partial/approximate) way
  * to place MAP.RRM section-local record coordinates into a shared
  * world-ish coordinate space, which last round did not have at all.
+ *
+ * ============================================================
+ * Phase 5 round 3 rotation hunt -- RULED OUT (2 more hypotheses) +
+ * one genuinely new confirmed structural fact. Full writeup in
+ * project memory (rr_pc_port.md, "Phase 5 round 3"); summary here so
+ * a future round doesn't retry the same dead ends:
+ *
+ * 1. IDX.HED cell VALUE bit-packing (does the int16 grid cell hold
+ *    more than a plain section index, e.g. high bits as a coarse
+ *    orientation octant?) -- RULED OUT, exhaustively. All 258 occupied
+ *    cells were checked: every value is EXACTLY the plain section
+ *    index 0..257 with zero bits set outside that range (no stray
+ *    high bits at all, not even one). There is no room in this field
+ *    for packed orientation data.
+ * 2. MAP.RRM section-directory count_d "always 0, maybe secretly a
+ *    flags/orientation field via unused count_d or high bits of
+ *    count_a/b/c" -- RULED OUT, exhaustively (re-checked all 258
+ *    entries, not a sample: count_d is 0 in literally all of them,
+ *    and count_a/b/c's arithmetic already accounts for the file's
+ *    exact byte size with zero slack, so there is no room to reuse
+ *    bits from those fields either without breaking the confirmed
+ *    file-size accounting). See map_rrm.h for the mirrored note.
+ * 3. Pure grid-topology dead-reckoning: chain each section's LOCAL
+ *    entry edge (first record's near edge) to the PREVIOUS section's
+ *    LOCAL exit edge (last record's far edge) via a rigid 2D
+ *    transform (rotation + translation solved exactly from the two
+ *    edge endpoints), propagated section-by-section from section 0
+ *    around the full 258-section loop -- RULED OUT. Tried both sign
+ *    conventions for "which edge points which way"; both produced a
+ *    loop-closure gap (distance between the computed final exit point
+ *    after section 257 and section 0's own entry point) of 42,000-
+ *    88,000 world units -- bigger than the track's entire ~65,536-unit
+ *    grid envelope (32 cells x 2048). Per-transition heading deltas
+ *    were essentially random (swinging by hundreds of degrees between
+ *    consecutive sections), confirming this isn't just accumulated
+ *    rounding error but a wrong premise. Cross-checked WITHIN a single
+ *    section first (chaining consecutive records inside one section's
+ *    own local frame, no transform): that DOES work almost perfectly
+ *    (corner-to-corner distances of ~10-30 world units, i.e. clean, on
+ *    most consecutive record pairs within section 11 as a spot check)
+ *    -- so per-section-internal geometry is self-consistent, but
+ *    treating "last record of section i" / "first record of section
+ *    i+1" as a reliable ACROSS-section join point is not valid in
+ *    general (large multi-record sections, e.g. sections 9-12 with
+ *    36-69 records each, are very likely branching/fanned clusters --
+ *    forks, guardrail meshes, a start/finish complex -- not simple
+ *    single paths, which breaks the entry/exit assumption globally).
+ * 4. NEW CONFIRMED FACT (not a rotation decode, but a real structural
+ *    finding): traced forward from the render-time consumer of the
+ *    MAP.RRM section table (rr-decomp func_80035638, the ~560-
+ *    instruction per-frame walk that reads D_801D35F0/D_801D82E8) into
+ *    its helper functions func_8004006C and func_80040140 -- both
+ *    CONFIRMED (instruction-level) to execute real PS1 GTE hardware
+ *    `rtps`/`rtpt` perspective-transform instructions (with `ctc2`
+ *    loading the GTE's resident 3x3 rotation-matrix control registers
+ *    and `mtc2` loading the input vector data registers). This means
+ *    rotation genuinely IS applied via a hardware matrix multiply at
+ *    render time, not baked into the MAP.RRM file -- exactly the
+ *    "matrix computed dynamically at runtime, never visible in a file
+ *    dump" scenario this round was asked to check for. HOWEVER: the
+ *    trace stops short of a full decode. Two nearby helper functions,
+ *    func_80043738/func_80043794, were also checked (they run right
+ *    around the same code path) and turned out to only NEGATE/mirror
+ *    the CURRENTLY-loaded matrix's X/Z-related components (a sign-flip
+ *    utility -- plausible use: L/R mirroring or a reflection pass),
+ *    not build a fresh per-section matrix from a stored angle. The
+ *    actual call site that constructs a NEW rotation matrix from some
+ *    section-specific angle (which would need to read/derive a heading
+ *    value and do a sin/cos-table lookup to fill the GTE control
+ *    registers) was NOT located this round -- concrete next-round lead:
+ *    find every `ctc2` write to GTE control regs 0-4 (not just the
+ *    negate-in-place pattern already found) and trace its rotation
+ *    values backward to their source.
+ * ============================================================
  */
 
 #ifndef RR_PC_PORT_IDX_HED_H
