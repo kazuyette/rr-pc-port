@@ -51,10 +51,29 @@
  *          section-index order (round 10 proved this order IS the real
  *          track traversal order) -- pure reuse of already-confirmed
  *          data, no new reverse engineering. Any direction key hands
- *          control back to the player.
- *      Both files are never bundled/committed -- point this at your own
- *      local extraction, e.g.:
- *        ./rr_pc_port --track /path/to/MAP.RRM /path/to/IDX.HED
+ *          control back to the player. Autopilot speed scales down
+ *          through corners based on local path curvature instead of
+ *          holding one fixed speed (round 12c).
+ *      Optional 4th argument: a TEX*.TMS path. When given, the road
+ *      surface (both view modes) is drawn with that file's first usable
+ *      decoded page (same page-picking heuristic as texture demo mode
+ *      above) instead of a flat color, tiled every
+ *      TRACK_TEXTURE_TILE_WORLD_UNITS world units via a simple planar
+ *      (world X/Z) UV mapping. KNOWN SIMPLIFICATION: MAP.RRM's real
+ *      per-record texture/material selection has never been decoded
+ *      (map_rrm.h's MapRrmRecord field comments list group_id/flags as
+ *      unconfirmed candidates) and doing so would need a live-debugging
+ *      round like rounds 8-10 used for the placement transform -- so
+ *      this paints the whole road with one uniform tiled texture rather
+ *      than the game's real per-section material, and (gpu_soft.c's
+ *      gpu_draw_quad_textured has no color-tint input) textured quads
+ *      skip the drive view's distance fog that flat-colored quads get.
+ *      Both honestly documented shortcuts, not silent inaccuracies.
+ *      Without this argument, behavior is unchanged (flat-colored road).
+ *      Both MAP.RRM/IDX.HED files (and the optional texture file) are
+ *      never bundled/committed -- point this at your own local
+ *      extraction, e.g.:
+ *        ./rr_pc_port --track /path/to/MAP.RRM /path/to/IDX.HED [/path/to/TEX0.TMS]
  *
  * This is scaffolding -- no asm-locked function, no audio, and the
  * track demo above is a debug view (top-down or a simplified flat-
@@ -259,7 +278,25 @@ typedef struct {
     MapRrmFile mf;
     IdxHedFile idxf;
     int ready;
+    /* Optional road texture (round 12d). Borrowed -- points into a
+     * TimFile owned and freed separately by main(), NOT by
+     * track_demo_free() below. NULL/0 means "no texture", i.e. the
+     * original flat-colored road. */
+    const uint32_t *tex_rgba;
+    int tex_w, tex_h;
 } TrackDemo;
+
+/* World-space planar UV tiling for the road texture: wraps a world
+ * coordinate into a [0,1) texture coordinate every
+ * TRACK_TEXTURE_TILE_WORLD_UNITS units. Deliberately simple (no
+ * per-record orientation/scale) -- see the file header comment for why
+ * a real per-material UV isn't attempted here. */
+#define TRACK_TEXTURE_TILE_WORLD_UNITS 512.0
+static float track_tile_uv(double world_coord) {
+    double t = world_coord / TRACK_TEXTURE_TILE_WORLD_UNITS;
+    double frac = t - floor(t);
+    return (float)frac;
+}
 
 static void track_demo_free(TrackDemo *td) {
     if (td->ready) {
@@ -645,20 +682,35 @@ static void draw_track_demo_scene(const TrackDemo *td) {
         const MapRrmTaggedRecord *tr = &mf->records[r];
         int32_t ox, oz;
         int x0, y0, x1, y1, x2, y2, x3, y3;
+        double wx0, wz0, wx1, wz1, wx2, wz2, wx3, wz3;
         if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
         if (!track_demo_is_real_road_section(mf, tr->section_index)) continue;
         if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
 
-        x0 = (int)(((ox + tr->rec.v0[0]) - cx) * scale) + GPU_FB_WIDTH / 2;
-        y0 = (int)(((oz + tr->rec.v0[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
-        x1 = (int)(((ox + tr->rec.v1[0]) - cx) * scale) + GPU_FB_WIDTH / 2;
-        y1 = (int)(((oz + tr->rec.v1[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
-        x2 = (int)(((ox + tr->rec.v3[0]) - cx) * scale) + GPU_FB_WIDTH / 2; /* note: v3 before v2 -- perimeter order */
-        y2 = (int)(((oz + tr->rec.v3[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
-        x3 = (int)(((ox + tr->rec.v2[0]) - cx) * scale) + GPU_FB_WIDTH / 2;
-        y3 = (int)(((oz + tr->rec.v2[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
+        /* v0,v1,v3,v2 perimeter order (note v3 before v2). */
+        wx0 = ox + tr->rec.v0[0]; wz0 = oz + tr->rec.v0[2];
+        wx1 = ox + tr->rec.v1[0]; wz1 = oz + tr->rec.v1[2];
+        wx2 = ox + tr->rec.v3[0]; wz2 = oz + tr->rec.v3[2];
+        wx3 = ox + tr->rec.v2[0]; wz3 = oz + tr->rec.v2[2];
 
-        gpu_draw_quad_flat(x0, y0, x1, y1, x2, y2, x3, y3, 0x003C965A);
+        x0 = (int)((wx0 - cx) * scale) + GPU_FB_WIDTH / 2;
+        y0 = (int)((wz0 - cz) * scale) + GPU_FB_HEIGHT / 2;
+        x1 = (int)((wx1 - cx) * scale) + GPU_FB_WIDTH / 2;
+        y1 = (int)((wz1 - cz) * scale) + GPU_FB_HEIGHT / 2;
+        x2 = (int)((wx2 - cx) * scale) + GPU_FB_WIDTH / 2;
+        y2 = (int)((wz2 - cz) * scale) + GPU_FB_HEIGHT / 2;
+        x3 = (int)((wx3 - cx) * scale) + GPU_FB_WIDTH / 2;
+        y3 = (int)((wz3 - cz) * scale) + GPU_FB_HEIGHT / 2;
+
+        if (td->tex_rgba != NULL) {
+            gpu_draw_quad_textured(x0, y0, track_tile_uv(wx0), track_tile_uv(wz0),
+                                    x1, y1, track_tile_uv(wx1), track_tile_uv(wz1),
+                                    x2, y2, track_tile_uv(wx2), track_tile_uv(wz2),
+                                    x3, y3, track_tile_uv(wx3), track_tile_uv(wz3),
+                                    td->tex_rgba, td->tex_w, td->tex_h);
+        } else {
+            gpu_draw_quad_flat(x0, y0, x1, y1, x2, y2, x3, y3, 0x003C965A);
+        }
     }
 }
 
@@ -669,6 +721,9 @@ typedef struct {
     double depth;
     int x0, y0, x1, y1, x2, y2, x3, y3;
     uint32_t color;
+    /* Per-vertex UVs, only meaningful/used when the scene has a road
+     * texture (td->tex_rgba != NULL) -- see draw_track_drive_scene. */
+    float u0, v0, u1, v1, u2, v2, u3, v3;
 } TrackDriveQuadJob;
 
 #define TRACK_DRIVE_MAX_QUADS 8192
@@ -717,6 +772,7 @@ static void draw_track_drive_scene(const TrackDemo *td) {
         int32_t ox, oz;
         int c, behind = 0;
         double rightv[4], depthv[4];
+        float uv_u[4], uv_v[4];
         double avg_depth = 0.0;
         int px[4], py[4];
         int fog;
@@ -736,6 +792,8 @@ static void draw_track_drive_scene(const TrackDemo *td) {
             depthv[c] = dx * sin_yaw + dz * cos_yaw;
             if (depthv[c] <= near_plane) behind = 1;
             avg_depth += depthv[c];
+            uv_u[c] = track_tile_uv(wx);
+            uv_v[c] = track_tile_uv(wz);
         }
         if (behind) continue; /* simple near-plane cull, no clipping -- see file header comment */
         avg_depth /= 4.0;
@@ -762,13 +820,27 @@ static void draw_track_drive_scene(const TrackDemo *td) {
         s_track_drive_jobs[njobs].x2 = px[2]; s_track_drive_jobs[njobs].y2 = py[2];
         s_track_drive_jobs[njobs].x3 = px[3]; s_track_drive_jobs[njobs].y3 = py[3];
         s_track_drive_jobs[njobs].color = color;
+        s_track_drive_jobs[njobs].u0 = uv_u[0]; s_track_drive_jobs[njobs].v0 = uv_v[0];
+        s_track_drive_jobs[njobs].u1 = uv_u[1]; s_track_drive_jobs[njobs].v1 = uv_v[1];
+        s_track_drive_jobs[njobs].u2 = uv_u[2]; s_track_drive_jobs[njobs].v2 = uv_v[2];
+        s_track_drive_jobs[njobs].u3 = uv_u[3]; s_track_drive_jobs[njobs].v3 = uv_v[3];
         njobs++;
     }
 
     qsort(s_track_drive_jobs, (size_t)njobs, sizeof(s_track_drive_jobs[0]), track_drive_job_cmp);
     for (r = 0; r < (size_t)njobs; r++) {
         const TrackDriveQuadJob *j = &s_track_drive_jobs[r];
-        gpu_draw_quad_flat(j->x0, j->y0, j->x1, j->y1, j->x2, j->y2, j->x3, j->y3, j->color);
+        if (td->tex_rgba != NULL) {
+            /* No fog/tint on textured quads -- gpu_draw_quad_textured
+             * has no color-tint input, see file header comment. */
+            gpu_draw_quad_textured(j->x0, j->y0, j->u0, j->v0,
+                                    j->x1, j->y1, j->u1, j->v1,
+                                    j->x2, j->y2, j->u2, j->v2,
+                                    j->x3, j->y3, j->u3, j->v3,
+                                    td->tex_rgba, td->tex_w, td->tex_h);
+        } else {
+            gpu_draw_quad_flat(j->x0, j->y0, j->x1, j->y1, j->x2, j->y2, j->x3, j->y3, j->color);
+        }
     }
 }
 
@@ -1084,17 +1156,21 @@ int main(int argc, char **argv) {
      * See the file header comment and the load_demo_*()/draw_*_scene()
      * functions above for what each does. */
     const char *tex_path = NULL;
-    const char *track_map_path = NULL, *track_idx_path = NULL;
+    const char *track_map_path = NULL, *track_idx_path = NULL, *track_tex_path = NULL;
     TimFile tex_file;
+    TimFile track_tex_file;
     const TimPage *tex_page = NULL;
+    const TimPage *track_tex_page = NULL;
     TrackDemo track;
 
     memset(&tex_file, 0, sizeof(tex_file));
+    memset(&track_tex_file, 0, sizeof(track_tex_file));
     memset(&track, 0, sizeof(track));
 
     if (argc > 1 && strcmp(argv[1], "--track") == 0) {
         if (argc > 2) track_map_path = argv[2];
         if (argc > 3) track_idx_path = argv[3];
+        if (argc > 4) track_tex_path = argv[4];
     } else if (argc > 1) {
         tex_path = argv[1];
     }
@@ -1114,6 +1190,17 @@ int main(int argc, char **argv) {
         printf("-- track demo mode: loading '%s' + '%s' --\n", track_map_path, track_idx_path);
         load_demo_track(track_map_path, track_idx_path, &track);
         /* On failure, track.ready stays 0 -- same graceful fallback. */
+        if (track_tex_path != NULL) {
+            printf("-- track demo mode: loading road texture '%s' --\n", track_tex_path);
+            if (load_demo_texture_page(track_tex_path, &track_tex_file, &track_tex_page)) {
+                track.tex_rgba = track_tex_page->rgba;
+                track.tex_w = track_tex_page->width;
+                track.tex_h = track_tex_page->height;
+            }
+            /* On failure, track.tex_rgba stays NULL -- falls back to
+             * the flat-colored road, same graceful-fallback convention
+             * as everywhere else in this file. */
+        }
     } else if (track_map_path != NULL) {
         printf("--track requires both <MAP.RRM> <IDX.HED> paths -- falling back to animated demo\n");
     }
@@ -1158,6 +1245,7 @@ int main(int argc, char **argv) {
 #endif
 
     tim_free(&tex_file);
+    tim_free(&track_tex_file);
     track_demo_free(&track);
 
     printf("phase 1+2+3 vertical slice complete, exiting 0\n");
