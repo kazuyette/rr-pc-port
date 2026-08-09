@@ -356,6 +356,59 @@ Zero regressions: full build (`rr_pc_port`, `rr_pc_port_gpu_test`,
 correctly held back per the standing rule of only wiring in a
 validated transform, and the transform is still incomplete.
 
+### Phase 5, round 4 -- full `ctc2` census (rotation still not decoded, but the search reframed with real new evidence)
+
+**Rotation still NOT decoded, but this round eliminated an entire wrong
+framing and dug one level deeper into the call graph.** Full reasoning
+in `idx_hed.h`'s header comment and project memory ("Phase 5 round 4").
+
+1. Enumerated every `ctc2` in the whole disassembly: 161 total, all in
+   `asm/29E8.s` (the data files have zero). Only 12 functions write
+   GTE control regs 0-4 (the rotation matrix); all 12 were read
+   instruction-by-instruction and are confirmed to be **generic**
+   PSY-Q-style matrix-library primitives (compose-two-matrices via
+   `mvmva`, a save/apply-temp-matrix/restore utility, a direct 3-word
+   loader) that take an *already-built* MATRIX struct pointer as an
+   argument -- none of them compute matrix cells from an angle via a
+   sin/cos table. **Reframing**: if this binary builds a rotation
+   matrix from an angle at all, that construction can't be found by
+   grepping for `ctc2` -- it would use plain multiply/shift + memory
+   stores to a MATRIX struct, only loaded into hardware *later* by one
+   of these 12 generic functions.
+2. New structural finding: `func_80035638` (called "the render walker"
+   since round 3) is one of **13 sibling functions** in a contiguous
+   ~14 KB code block (`func_80033BFC`..`func_80037478`) sharing the
+   identical mirror-flip + `rtps`/`rtpt` inner pattern -- this whole
+   block is the game's shared 3D geometry draw module. 6 of the 13
+   (including `func_80035638`) have zero static callers anywhere in
+   the disassembly and are reached only through runtime-computed
+   `jalr` dispatch (confirmed: none of the file's 59 `jalr` sites build
+   their target from a static literal address, and no matching pointer
+   exists in either data file) -- not resolvable by text search alone.
+3. Traced one concrete link successfully: `func_80012E44` (7 call
+   sites, each exactly once per invocation, no loop -- "draw one
+   batch/frame" not "once per section") calls
+   `func_80043470(a0=D_801E91F0)` (one of the 12 rotation-writing
+   functions) immediately before calling the first two members of the
+   13-function draw module. `D_801E91F0` turned out to be a heavily
+   shared (150+ xref) scratch matrix touched by clearly unrelated
+   subsystems too (roadside-object visibility culling against the
+   already-known OBJ.RRO count global and a 2048-unit world-cell
+   bitmask) -- a general "currently active transform" register, not a
+   track-section-dedicated field. The write site that actually
+   populates its rotation cells from section/heading data was not
+   found this round (ran out of budget on this thread, not ruled out).
+4. A live Ghidra MCP bridge was tried specifically to resolve the
+   indirect `jalr` targets from point 2, but was not connected on the
+   user's device this round -- reconnecting it is the top tool
+   prerequisite for the next round, since Ghidra's own dataflow
+   analysis can resolve indirect calls that pure disassembly grep
+   structurally cannot.
+
+Zero regressions: this round was investigation + documentation only
+(no functional code changes), full build/test suite untouched and
+still passing. No rasterizer wiring -- rotation still unresolved.
+
 ## Phase 6 -- Audio
 
 SPU emulation or a from-scratch replacement audio engine, once there's
