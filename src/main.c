@@ -422,10 +422,30 @@ static void track_view_reset(const TrackDemo *td) {
 #define TRACK_AUTOPILOT_MAX_WAYPOINTS 2048
 static double s_autopilot_wp_x[TRACK_AUTOPILOT_MAX_WAYPOINTS];
 static double s_autopilot_wp_z[TRACK_AUTOPILOT_MAX_WAYPOINTS];
+/* Per-waypoint speed multiplier derived from local path curvature --
+ * see the comment inside track_view_build_autopilot_path below for how
+ * it's computed. 1.0 = full speed (straight), down to
+ * TRACK_AUTOPILOT_MIN_SPEED_SCALE (sharpest hairpin). */
+static double s_autopilot_wp_speed_scale[TRACK_AUTOPILOT_MAX_WAYPOINTS];
 static int s_autopilot_wp_count = 0;
 static int s_autopilot_on = 0;
 static double s_autopilot_t = 0.0;         /* position along the path, in waypoint units */
-static const double s_autopilot_speed = 0.5; /* waypoints per second */
+static const double s_autopilot_base_speed = 0.5; /* waypoints per second, on a dead-straight stretch */
+#define TRACK_AUTOPILOT_MIN_SPEED_SCALE 0.35 /* floor speed multiplier through the sharpest hairpins */
+
+/* Returns waypoint index `i` modulo the (looped) waypoint count,
+ * handling negative `i` correctly (needed for the Catmull-Rom "point
+ * before the segment start" sample, and for the curvature lookbehind
+ * below). Declared ahead of track_view_build_autopilot_path because
+ * that function now uses it too (curvature precompute). */
+static int autopilot_wp_index(int i) {
+    int n = s_autopilot_wp_count;
+    int m;
+    if (n <= 0) return 0;
+    m = i % n;
+    if (m < 0) m += n;
+    return m;
+}
 
 static void track_view_build_autopilot_path(const TrackDemo *td) {
     const MapRrmFile *mf = &td->mf;
@@ -434,6 +454,7 @@ static void track_view_build_autopilot_path(const TrackDemo *td) {
     int *count;
     uint16_t s;
     size_t r;
+    int i;
 
     s_autopilot_wp_count = 0;
     if (mf->section_count == 0) return;
@@ -466,20 +487,50 @@ static void track_view_build_autopilot_path(const TrackDemo *td) {
     }
 
     free(sum_x); free(sum_z); free(count);
-    printf("autopilot: built a %d-waypoint lap path from real-road section centroids\n", s_autopilot_wp_count);
+
+    /* Curvature-based speed precompute (new this round): rounds 12/12b
+     * drove the whole lap at one fixed speed, which reads as unnatural
+     * now that the Catmull-Rom smoothing (round 12b) makes cornering
+     * visually obvious -- a real driving line slows for corners. For
+     * each waypoint, compare the incoming heading (wp[i-1] -> wp[i])
+     * against the outgoing heading (wp[i] -> wp[i+1]) via their unit
+     * dot product: 1.0 = dead straight, -1.0 = a full reversal
+     * (tightest possible hairpin). Linearly remapped onto
+     * [TRACK_AUTOPILOT_MIN_SPEED_SCALE, 1.0] so the car eases into and
+     * out of corners instead of an abrupt per-waypoint speed step --
+     * track_view_autopilot_update below blends between two consecutive
+     * waypoints' scale by the same `t` used for position, so the speed
+     * itself is C0-continuous along the lap. No new reverse engineering
+     * here: purely a function of the already-confirmed waypoint
+     * centroids from round 10/12. */
+    for (i = 0; i < s_autopilot_wp_count; i++) {
+        int ip = autopilot_wp_index(i - 1);
+        int in = autopilot_wp_index(i + 1);
+        double inx = s_autopilot_wp_x[i] - s_autopilot_wp_x[ip];
+        double inz = s_autopilot_wp_z[i] - s_autopilot_wp_z[ip];
+        double outx = s_autopilot_wp_x[in] - s_autopilot_wp_x[i];
+        double outz = s_autopilot_wp_z[in] - s_autopilot_wp_z[i];
+        double in_len = sqrt(inx * inx + inz * inz);
+        double out_len = sqrt(outx * outx + outz * outz);
+        double dot, blend;
+        if (in_len < 1e-6 || out_len < 1e-6) {
+            s_autopilot_wp_speed_scale[i] = 1.0;
+            continue;
+        }
+        dot = (inx * outx + inz * outz) / (in_len * out_len);
+        if (dot > 1.0) dot = 1.0;
+        if (dot < -1.0) dot = -1.0;
+        blend = (dot + 1.0) * 0.5; /* 0 = hairpin reversal, 1 = dead straight */
+        s_autopilot_wp_speed_scale[i] = TRACK_AUTOPILOT_MIN_SPEED_SCALE +
+            (1.0 - TRACK_AUTOPILOT_MIN_SPEED_SCALE) * blend;
+    }
+
+    printf("autopilot: built a %d-waypoint lap path from real-road section centroids "
+           "(curvature-based speed scaling active)\n", s_autopilot_wp_count);
 }
 
 /* Advances the camera along the autopilot path by `dt` seconds. No-op
  * if autopilot is off or the path hasn't been built yet. */
-/* Returns waypoint index `i` modulo the (looped) waypoint count,
- * handling negative `i` correctly (needed for the Catmull-Rom "point
- * before the segment start" sample). */
-static int autopilot_wp_index(int i) {
-    int n = s_autopilot_wp_count;
-    int m = i % n;
-    if (m < 0) m += n;
-    return m;
-}
 
 /* Catmull-Rom spline through the looped waypoint list -- round 12
  * originally used a straight lerp between consecutive waypoints, which
@@ -495,10 +546,24 @@ static void track_view_autopilot_update(double dt) {
     double p_m1x, p0x, p1x, p2x;
     double p_m1z, p0z, p1z, p2z;
     double dx, dz;
+    double speed_scale, speed;
 
     if (!s_autopilot_on || s_autopilot_wp_count < 2) return;
 
-    s_autopilot_t += s_autopilot_speed * dt;
+    /* Curvature-scaled speed: blend this waypoint's and the next one's
+     * precomputed scale by the current fractional position `t`, so the
+     * speed itself ramps smoothly into/out of corners instead of
+     * stepping at each waypoint crossing. Uses the position from
+     * *before* this frame's advance (last frame's settled s_autopilot_t),
+     * same as the position/tangent computation below does after the
+     * advance -- one frame of lag on the speed scale is imperceptible. */
+    i0 = (int)s_autopilot_t;
+    t = s_autopilot_t - (double)i0;
+    i1 = autopilot_wp_index(i0 + 1);
+    speed_scale = s_autopilot_wp_speed_scale[i0] * (1.0 - t) + s_autopilot_wp_speed_scale[i1] * t;
+    speed = s_autopilot_base_speed * speed_scale;
+
+    s_autopilot_t += speed * dt;
     while (s_autopilot_t >= (double)s_autopilot_wp_count) s_autopilot_t -= (double)s_autopilot_wp_count;
 
     i0 = (int)s_autopilot_t;
