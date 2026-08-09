@@ -25,23 +25,36 @@
  *        ./rr_pc_port /path/to/TEX0.TMS
  *   5. Real-track demo mode: if invoked with `--track <MAP.RRM>
  *      <IDX.HED>`, parses both files (tools/mapparse/map_rrm.c +
- *      idx_hed.c) and draws a static top-down view of the real track
- *      using gpu_draw_quad_flat() -- one filled quad per type-B (road
- *      surface) record, translated to its section's IDX.HED grid-cell
- *      anchor (the round 8-10 confirmed, byte/algebra-verified
- *      translation-only placement model; see project memory
- *      rr_pc_port_round8.md..round10.md and tools/mapparse/worldmap_main.c,
- *      whose standalone-PPM version of this exact rendering approach
- *      this mode mirrors, now flowing through the real rasterizer
- *      instead of a raw PPM writer). Sections with <=2 total records
- *      are skipped (round 10 finding: markers/junction nodes, not road
- *      geometry). Both files are never bundled/committed -- point this
- *      at your own local extraction, e.g.:
+ *      idx_hed.c) and draws the real track using gpu_draw_quad_flat()
+ *      -- one filled quad per type-B (road surface) record, translated
+ *      to its section's IDX.HED grid-cell anchor (the round 8-10
+ *      confirmed, byte/algebra-verified translation-only placement
+ *      model; see project memory rr_pc_port_round8.md..round10.md and
+ *      tools/mapparse/worldmap_main.c, whose standalone-PPM version of
+ *      this exact approach this mode mirrors, now flowing through the
+ *      real rasterizer instead of a raw PPM writer). Sections with <=2
+ *      total records are skipped (round 10 finding: markers/junction
+ *      nodes, not road geometry). Two view modes, toggled with V:
+ *        - Top (default): orthographic top-down debug view, arrow keys
+ *          pan / +/- zoom / R resets.
+ *        - Drive: a perspective camera you steer through the track --
+ *          up/down move forward/back, left/right turn, +/- raise/lower
+ *          the camera, R resets to a spawn point over the track's
+ *          bounding-box center. KNOWN SIMPLIFICATION: this treats the
+ *          track as a flat plane at Y=0 and ignores each vertex's real
+ *          MAP.RRM Y (height) field -- that field has not been verified
+ *          the way X/Z were in rounds 8-10, so using it for real
+ *          elevation is future work, not done here. Occlusion is a
+ *          back-to-front depth sort, exact for a flat non-overlapping
+ *          plane.
+ *      Both files are never bundled/committed -- point this at your own
+ *      local extraction, e.g.:
  *        ./rr_pc_port --track /path/to/MAP.RRM /path/to/IDX.HED
  *
  * This is scaffolding -- no asm-locked function, no audio, and the
- * track demo above is a static top-down debug view (not a playable
- * driving camera yet -- that's a later phase). See ROADMAP.md.
+ * track demo above is a debug view (top-down or a simplified flat-
+ * ground drive camera), not the real game's actual driving/rendering
+ * code -- that's a later phase. See ROADMAP.md.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -313,32 +326,43 @@ static int track_demo_is_real_road_section(const MapRrmFile *mf, uint16_t sectio
 static double s_track_zoom = 1.0;
 static double s_track_pan_x = 0.0, s_track_pan_z = 0.0;
 
-static void track_view_reset(void) {
+/* Which of the two track-demo view modes is active; toggled with V in
+ * run_sdl_loop's event loop. TRACK_VIEW_TOP is the original round-10
+ * orthographic debug view (unchanged); TRACK_VIEW_DRIVE is the newer
+ * perspective camera (see file header comment for its simplifications). */
+#define TRACK_VIEW_TOP   0
+#define TRACK_VIEW_DRIVE 1
+static int s_track_view_mode = TRACK_VIEW_TOP;
+
+/* Drive-camera state: position in world X/Z, height above the (flat,
+ * simplified) Y=0 ground plane, and yaw in radians (0 = facing +Z,
+ * increasing yaw turns the facing direction toward +X -- see
+ * draw_track_drive_scene's comment for the exact rotation convention). */
+static double s_cam_x = 0.0, s_cam_z = 0.0, s_cam_height = 300.0, s_cam_yaw = 0.0;
+
+#define TRACK_DRIVE_MOVE_STEP   60.0
+#define TRACK_DRIVE_TURN_STEP   0.08
+#define TRACK_DRIVE_HEIGHT_STEP 30.0
+#define TRACK_DRIVE_HEIGHT_MIN  20.0
+#define TRACK_DRIVE_HEIGHT_MAX  4000.0
+
+static void track_view_reset_top(void) {
     s_track_zoom = 1.0;
     s_track_pan_x = 0.0;
     s_track_pan_z = 0.0;
 }
 
-/* Top-down render of the real track: one filled quad per type-B (road
- * surface) record, world position = local record vertex + IDX.HED
- * grid-cell anchor (translation-only, no rotation -- see file header
- * comment). `s_track_zoom`==1.0 and no pan fits the whole track on
- * screen preserving aspect ratio; arrow keys/+/- let the user explore
- * closer, since round 10's small residual notches (very-high-record
- * junction sections) are easiest to inspect zoomed in. */
-static void draw_track_demo_scene(const TrackDemo *td) {
+/* Pass over the same record set draw_track_demo_scene()/
+ * draw_track_drive_scene() draw (real-road sections, type B only) to
+ * get a world-space bounding box -- shared so the top-down auto-fit
+ * and the drive camera's spawn point agree on what "the track" spans. */
+static int track_demo_world_bbox(const TrackDemo *td, double *ominx, double *omaxx,
+                                  double *ominz, double *omaxz) {
     const MapRrmFile *mf = &td->mf;
     const IdxHedFile *idxf = &td->idxf;
     double minx = 1e18, maxx = -1e18, minz = 1e18, maxz = -1e18;
-    double fit_scale, scale, cx, cz;
     size_t r;
-    int margin = 6;
 
-    gpu_clear(0x00080810);
-
-    /* Pass 1: world-space bbox over the same record set we're about to
-     * draw (real-road sections, type B only) -- used both to compute
-     * the auto-fit scale and as the default view center. */
     for (r = 0; r < mf->record_count; r++) {
         const MapRrmTaggedRecord *tr = &mf->records[r];
         int32_t ox, oz;
@@ -355,7 +379,53 @@ static void draw_track_demo_scene(const TrackDemo *td) {
             if (wz > maxz) maxz = wz;
         }
     }
-    if (maxx <= minx || maxz <= minz) {
+    if (maxx <= minx || maxz <= minz) return 0;
+    *ominx = minx; *omaxx = maxx; *ominz = minz; *omaxz = maxz;
+    return 1;
+}
+
+/* Spawns the drive camera at the track's bounding-box center, facing
+ * +Z, at a fixed default height. Falls back to the origin if the track
+ * isn't loaded/ready (e.g. called before load_demo_track succeeds). */
+static void track_view_reset_drive(const TrackDemo *td) {
+    double minx, maxx, minz, maxz;
+    s_cam_yaw = 0.0;
+    s_cam_height = 300.0;
+    if (td != NULL && td->ready && track_demo_world_bbox(td, &minx, &maxx, &minz, &maxz)) {
+        s_cam_x = (minx + maxx) / 2.0;
+        s_cam_z = (minz + maxz) / 2.0;
+    } else {
+        s_cam_x = 0.0;
+        s_cam_z = 0.0;
+    }
+}
+
+static void track_view_reset(const TrackDemo *td) {
+    track_view_reset_top();
+    track_view_reset_drive(td);
+}
+
+/* Top-down render of the real track: one filled quad per type-B (road
+ * surface) record, world position = local record vertex + IDX.HED
+ * grid-cell anchor (translation-only, no rotation -- see file header
+ * comment). `s_track_zoom`==1.0 and no pan fits the whole track on
+ * screen preserving aspect ratio; arrow keys/+/- let the user explore
+ * closer, since round 10's small residual notches (very-high-record
+ * junction sections) are easiest to inspect zoomed in. */
+static void draw_track_demo_scene(const TrackDemo *td) {
+    const MapRrmFile *mf = &td->mf;
+    const IdxHedFile *idxf = &td->idxf;
+    double minx, maxx, minz, maxz;
+    double fit_scale, scale, cx, cz;
+    size_t r;
+    int margin = 6;
+
+    gpu_clear(0x00080810);
+
+    /* Pass 1: world-space bbox over the same record set we're about to
+     * draw (real-road sections, type B only) -- used both to compute
+     * the auto-fit scale and as the default view center. */
+    if (!track_demo_world_bbox(td, &minx, &maxx, &minz, &maxz)) {
         return; /* nothing to draw (e.g. IDX.HED had zero occupied cells) */
     }
 
@@ -392,6 +462,125 @@ static void draw_track_demo_scene(const TrackDemo *td) {
         y3 = (int)(((oz + tr->rec.v2[2]) - cz) * scale) + GPU_FB_HEIGHT / 2;
 
         gpu_draw_quad_flat(x0, y0, x1, y1, x2, y2, x3, y3, 0x003C965A);
+    }
+}
+
+/* One projected, depth-sortable quad, staged by draw_track_drive_scene
+ * before the actual draw calls so the whole frame's worth of quads can
+ * be painter's-algorithm sorted back-to-front first. */
+typedef struct {
+    double depth;
+    int x0, y0, x1, y1, x2, y2, x3, y3;
+    uint32_t color;
+} TrackDriveQuadJob;
+
+#define TRACK_DRIVE_MAX_QUADS 8192
+static TrackDriveQuadJob s_track_drive_jobs[TRACK_DRIVE_MAX_QUADS];
+
+static int track_drive_job_cmp(const void *pa, const void *pb) {
+    const TrackDriveQuadJob *a = (const TrackDriveQuadJob *)pa;
+    const TrackDriveQuadJob *b = (const TrackDriveQuadJob *)pb;
+    /* Farthest first (descending depth) -- painter's algorithm. */
+    if (a->depth > b->depth) return -1;
+    if (a->depth < b->depth) return 1;
+    return 0;
+}
+
+/* Perspective drive-camera render -- see the file header comment for
+ * the flat-ground-plane simplification this makes. Camera-space axes:
+ * `right` = dx*cos(yaw) - dz*sin(yaw), `forward` (depth) = dx*sin(yaw)
+ * + dz*cos(yaw), where (dx,dz) = world position minus camera position.
+ * At yaw==0 this reduces to right=dx, forward=dz (camera faces +Z),
+ * and increasing yaw rotates the facing direction from +Z toward +X.
+ * Screen projection is a standard pinhole model (screen = focal *
+ * lateral / depth), with a fixed camera height above the Y=0 ground
+ * plane standing in for real elevation data. */
+static void draw_track_drive_scene(const TrackDemo *td) {
+    const MapRrmFile *mf = &td->mf;
+    const IdxHedFile *idxf = &td->idxf;
+    size_t r;
+    int njobs = 0;
+    double cos_yaw = cos(s_cam_yaw), sin_yaw = sin(s_cam_yaw);
+    /* ~80 degree horizontal FOV; focal length in pixels for a
+     * GPU_FB_WIDTH-wide framebuffer. */
+    double focal = (GPU_FB_WIDTH / 2.0) / tan(80.0 * 3.14159265358979 / 180.0 / 2.0);
+    const double near_plane = 20.0;   /* world units; vertices closer than this are dropped */
+    const double far_fog = 6000.0;    /* world units; distance fog fades to background by here */
+    /* Screen coords are clamped to this before handing to
+     * gpu_draw_quad_flat -- keeps the int edge-function math in
+     * gpu_soft.c (see gpu_draw_triangle_flat) well inside int32 range
+     * even for near-camera geometry that projects far off-screen,
+     * while still being well outside the visible framebuffer. */
+    const int coord_clamp = 20000;
+
+    gpu_clear(0x00080810);
+
+    for (r = 0; r < mf->record_count && njobs < TRACK_DRIVE_MAX_QUADS; r++) {
+        const MapRrmTaggedRecord *tr = &mf->records[r];
+        int32_t ox, oz;
+        int c, behind = 0;
+        double rightv[4], depthv[4];
+        double avg_depth = 0.0;
+        int px[4], py[4];
+        int fog;
+        uint32_t color;
+
+        if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
+        if (!track_demo_is_real_road_section(mf, tr->section_index)) continue;
+        if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
+
+        for (c = 0; c < 4; c++) {
+            /* v0,v1,v3,v2 perimeter order, same convention as the
+             * top-down view's pass 2. */
+            const int16_t *v = (c == 0) ? tr->rec.v0 : (c == 1) ? tr->rec.v1 : (c == 2) ? tr->rec.v3 : tr->rec.v2;
+            double wx = ox + v[0], wz = oz + v[2];
+            double dx = wx - s_cam_x, dz = wz - s_cam_z;
+            rightv[c] = dx * cos_yaw - dz * sin_yaw;
+            depthv[c] = dx * sin_yaw + dz * cos_yaw;
+            if (depthv[c] <= near_plane) behind = 1;
+            avg_depth += depthv[c];
+        }
+        if (behind) continue; /* simple near-plane cull, no clipping -- see file header comment */
+        avg_depth /= 4.0;
+
+        for (c = 0; c < 4; c++) {
+            px[c] = (int)((rightv[c] / depthv[c]) * focal) + GPU_FB_WIDTH / 2;
+            py[c] = (int)((s_cam_height / depthv[c]) * focal) + GPU_FB_HEIGHT / 2;
+            if (px[c] < -coord_clamp) px[c] = -coord_clamp;
+            if (px[c] > coord_clamp) px[c] = coord_clamp;
+            if (py[c] < -coord_clamp) py[c] = -coord_clamp;
+            if (py[c] > coord_clamp) py[c] = coord_clamp;
+        }
+
+        fog = (int)(255.0 * (1.0 - avg_depth / far_fog));
+        if (fog < 40) fog = 40;
+        if (fog > 255) fog = 255;
+        color = ((uint32_t)((0x3C * fog) / 255) << 16) |
+                ((uint32_t)((0x96 * fog) / 255) << 8) |
+                (uint32_t)((0x5A * fog) / 255);
+
+        s_track_drive_jobs[njobs].depth = avg_depth;
+        s_track_drive_jobs[njobs].x0 = px[0]; s_track_drive_jobs[njobs].y0 = py[0];
+        s_track_drive_jobs[njobs].x1 = px[1]; s_track_drive_jobs[njobs].y1 = py[1];
+        s_track_drive_jobs[njobs].x2 = px[2]; s_track_drive_jobs[njobs].y2 = py[2];
+        s_track_drive_jobs[njobs].x3 = px[3]; s_track_drive_jobs[njobs].y3 = py[3];
+        s_track_drive_jobs[njobs].color = color;
+        njobs++;
+    }
+
+    qsort(s_track_drive_jobs, (size_t)njobs, sizeof(s_track_drive_jobs[0]), track_drive_job_cmp);
+    for (r = 0; r < (size_t)njobs; r++) {
+        const TrackDriveQuadJob *j = &s_track_drive_jobs[r];
+        gpu_draw_quad_flat(j->x0, j->y0, j->x1, j->y1, j->x2, j->y2, j->x3, j->y3, j->color);
+    }
+}
+
+/* Dispatches to whichever track-demo view mode is active. */
+static void draw_track_view(const TrackDemo *td) {
+    if (s_track_view_mode == TRACK_VIEW_DRIVE) {
+        draw_track_drive_scene(td);
+    } else {
+        draw_track_demo_scene(td);
     }
 }
 
@@ -561,8 +750,12 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
     if (!is_headless) {
         printf("window open -- close it (or press Escape) to exit\n");
         if (track != NULL && track->ready) {
-            printf("track demo controls: arrow keys pan, +/- zoom, R resets view\n");
-            track_view_reset();
+            printf("track demo controls: V toggles top-down/drive view; "
+                   "top-down: arrow keys pan, +/- zoom; "
+                   "drive: up/down move, left/right turn, +/- height; "
+                   "R resets the active view\n");
+            s_track_view_mode = TRACK_VIEW_TOP;
+            track_view_reset(track);
         }
     }
 
@@ -578,29 +771,59 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                     default: break;
                 }
                 if (track != NULL && track->ready) {
-                    /* Pan step is in world units, scaled down as zoom
-                     * increases so a keypress always moves about the
-                     * same fraction of the visible view, not a fixed
-                     * world distance that would fly off-screen at high
-                     * zoom or crawl at low zoom. */
-                    double pan_step = 300.0 / s_track_zoom;
-                    switch (ev.key.keysym.sym) {
-                        case SDLK_LEFT:  s_track_pan_x -= pan_step; break;
-                        case SDLK_RIGHT: s_track_pan_x += pan_step; break;
-                        case SDLK_UP:    s_track_pan_z -= pan_step; break;
-                        case SDLK_DOWN:  s_track_pan_z += pan_step; break;
-                        case SDLK_EQUALS: case SDLK_KP_PLUS:
-                            s_track_zoom *= 1.2;
-                            if (s_track_zoom > 40.0) s_track_zoom = 40.0;
-                            break;
-                        case SDLK_MINUS: case SDLK_KP_MINUS:
-                            s_track_zoom /= 1.2;
-                            if (s_track_zoom < 0.2) s_track_zoom = 0.2;
-                            break;
-                        case SDLK_r:
-                            track_view_reset();
-                            break;
-                        default: break;
+                    if (ev.key.keysym.sym == SDLK_v) {
+                        s_track_view_mode = (s_track_view_mode == TRACK_VIEW_TOP)
+                            ? TRACK_VIEW_DRIVE : TRACK_VIEW_TOP;
+                    } else if (s_track_view_mode == TRACK_VIEW_DRIVE) {
+                        switch (ev.key.keysym.sym) {
+                            case SDLK_UP:
+                                s_cam_x += sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                s_cam_z += cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                break;
+                            case SDLK_DOWN:
+                                s_cam_x -= sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                s_cam_z -= cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                break;
+                            case SDLK_LEFT:  s_cam_yaw -= TRACK_DRIVE_TURN_STEP; break;
+                            case SDLK_RIGHT: s_cam_yaw += TRACK_DRIVE_TURN_STEP; break;
+                            case SDLK_EQUALS: case SDLK_KP_PLUS:
+                                s_cam_height += TRACK_DRIVE_HEIGHT_STEP;
+                                if (s_cam_height > TRACK_DRIVE_HEIGHT_MAX) s_cam_height = TRACK_DRIVE_HEIGHT_MAX;
+                                break;
+                            case SDLK_MINUS: case SDLK_KP_MINUS:
+                                s_cam_height -= TRACK_DRIVE_HEIGHT_STEP;
+                                if (s_cam_height < TRACK_DRIVE_HEIGHT_MIN) s_cam_height = TRACK_DRIVE_HEIGHT_MIN;
+                                break;
+                            case SDLK_r:
+                                track_view_reset_drive(track);
+                                break;
+                            default: break;
+                        }
+                    } else {
+                        /* Pan step is in world units, scaled down as zoom
+                         * increases so a keypress always moves about the
+                         * same fraction of the visible view, not a fixed
+                         * world distance that would fly off-screen at high
+                         * zoom or crawl at low zoom. */
+                        double pan_step = 300.0 / s_track_zoom;
+                        switch (ev.key.keysym.sym) {
+                            case SDLK_LEFT:  s_track_pan_x -= pan_step; break;
+                            case SDLK_RIGHT: s_track_pan_x += pan_step; break;
+                            case SDLK_UP:    s_track_pan_z -= pan_step; break;
+                            case SDLK_DOWN:  s_track_pan_z += pan_step; break;
+                            case SDLK_EQUALS: case SDLK_KP_PLUS:
+                                s_track_zoom *= 1.2;
+                                if (s_track_zoom > 40.0) s_track_zoom = 40.0;
+                                break;
+                            case SDLK_MINUS: case SDLK_KP_MINUS:
+                                s_track_zoom /= 1.2;
+                                if (s_track_zoom < 0.2) s_track_zoom = 0.2;
+                                break;
+                            case SDLK_r:
+                                track_view_reset_top();
+                                break;
+                            default: break;
+                        }
                     }
                 }
             }
@@ -609,7 +832,7 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         if (tex_page != NULL) {
             draw_texture_demo_scene(tex_page);
         } else if (track != NULL && track->ready) {
-            draw_track_demo_scene(track);
+            draw_track_view(track);
         } else {
             draw_animated_scene(SDL_GetTicks() - start);
         }
