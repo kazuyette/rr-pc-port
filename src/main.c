@@ -46,7 +46,12 @@
  *          the way X/Z were in rounds 8-10, so using it for real
  *          elevation is future work, not done here. Occlusion is a
  *          back-to-front depth sort, exact for a flat non-overlapping
- *          plane.
+ *          plane. P toggles autopilot: an automatic lap around a path
+ *          built from each real-road section's centroid, visited in
+ *          section-index order (round 10 proved this order IS the real
+ *          track traversal order) -- pure reuse of already-confirmed
+ *          data, no new reverse engineering. Any direction key hands
+ *          control back to the player.
  *      Both files are never bundled/committed -- point this at your own
  *      local extraction, e.g.:
  *        ./rr_pc_port --track /path/to/MAP.RRM /path/to/IDX.HED
@@ -405,6 +410,93 @@ static void track_view_reset(const TrackDemo *td) {
     track_view_reset_drive(td);
 }
 
+/* Autopilot: flies the drive camera around a lap automatically, using
+ * the round-10 confirmed finding that MAP.RRM's section index order IS
+ * the real track traversal order (the rainbow-gradient render proved
+ * this -- a single, perfectly continuous loop with zero scrambling).
+ * The path is just each real-road section's centroid, visited in
+ * section-index order and looped back to the start; no new reverse
+ * engineering needed, this is built entirely from already-confirmed
+ * data. Toggled with P; any manual direction key while it's running
+ * hands control back to the player. */
+#define TRACK_AUTOPILOT_MAX_WAYPOINTS 2048
+static double s_autopilot_wp_x[TRACK_AUTOPILOT_MAX_WAYPOINTS];
+static double s_autopilot_wp_z[TRACK_AUTOPILOT_MAX_WAYPOINTS];
+static int s_autopilot_wp_count = 0;
+static int s_autopilot_on = 0;
+static double s_autopilot_t = 0.0;         /* position along the path, in waypoint units */
+static const double s_autopilot_speed = 0.5; /* waypoints per second */
+
+static void track_view_build_autopilot_path(const TrackDemo *td) {
+    const MapRrmFile *mf = &td->mf;
+    const IdxHedFile *idxf = &td->idxf;
+    double *sum_x, *sum_z;
+    int *count;
+    uint16_t s;
+    size_t r;
+
+    s_autopilot_wp_count = 0;
+    if (mf->section_count == 0) return;
+
+    sum_x = (double *)calloc(mf->section_count, sizeof(double));
+    sum_z = (double *)calloc(mf->section_count, sizeof(double));
+    count = (int *)calloc(mf->section_count, sizeof(int));
+    if (sum_x == NULL || sum_z == NULL || count == NULL) {
+        free(sum_x); free(sum_z); free(count);
+        return;
+    }
+
+    for (r = 0; r < mf->record_count; r++) {
+        const MapRrmTaggedRecord *tr = &mf->records[r];
+        int32_t ox, oz;
+        if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
+        if (tr->section_index >= mf->section_count) continue;
+        if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
+        sum_x[tr->section_index] += ox + tr->rec.v0[0];
+        sum_z[tr->section_index] += oz + tr->rec.v0[2];
+        count[tr->section_index]++;
+    }
+
+    for (s = 0; s < mf->section_count && s_autopilot_wp_count < TRACK_AUTOPILOT_MAX_WAYPOINTS; s++) {
+        if (!track_demo_is_real_road_section(mf, s)) continue;
+        if (count[s] == 0) continue;
+        s_autopilot_wp_x[s_autopilot_wp_count] = sum_x[s] / count[s];
+        s_autopilot_wp_z[s_autopilot_wp_count] = sum_z[s] / count[s];
+        s_autopilot_wp_count++;
+    }
+
+    free(sum_x); free(sum_z); free(count);
+    printf("autopilot: built a %d-waypoint lap path from real-road section centroids\n", s_autopilot_wp_count);
+}
+
+/* Advances the camera along the autopilot path by `dt` seconds. No-op
+ * if autopilot is off or the path hasn't been built yet. */
+static void track_view_autopilot_update(double dt) {
+    int i0, i1;
+    double frac, x0, z0, x1, z1, dx, dz;
+
+    if (!s_autopilot_on || s_autopilot_wp_count < 2) return;
+
+    s_autopilot_t += s_autopilot_speed * dt;
+    while (s_autopilot_t >= (double)s_autopilot_wp_count) s_autopilot_t -= (double)s_autopilot_wp_count;
+
+    i0 = (int)s_autopilot_t;
+    i1 = (i0 + 1) % s_autopilot_wp_count;
+    frac = s_autopilot_t - (double)i0;
+
+    x0 = s_autopilot_wp_x[i0]; z0 = s_autopilot_wp_z[i0];
+    x1 = s_autopilot_wp_x[i1]; z1 = s_autopilot_wp_z[i1];
+
+    s_cam_x = x0 + (x1 - x0) * frac;
+    s_cam_z = z0 + (z1 - z0) * frac;
+
+    dx = x1 - x0;
+    dz = z1 - z0;
+    if (dx != 0.0 || dz != 0.0) {
+        s_cam_yaw = atan2(dx, dz); /* matches this file's yaw convention: forward = (sin(yaw), cos(yaw)) */
+    }
+}
+
 /* Top-down render of the real track: one filled quad per type-B (road
  * surface) record, world position = local record vertex + IDX.HED
  * grid-cell anchor (translation-only, no rotation -- see file header
@@ -752,16 +844,23 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         if (track != NULL && track->ready) {
             printf("track demo controls: V toggles top-down/drive view; "
                    "top-down: arrow keys pan, +/- zoom; "
-                   "drive: up/down move, left/right turn, +/- height; "
+                   "drive: up/down move, left/right turn, +/- height, "
+                   "P toggles autopilot (auto-drives a lap using the "
+                   "confirmed section-order path -- any direction key "
+                   "hands control back); "
                    "R resets the active view\n");
             s_track_view_mode = TRACK_VIEW_TOP;
+            s_autopilot_on = 0;
             track_view_reset(track);
         }
     }
 
     Uint32 start = SDL_GetTicks();
+    Uint32 last_ticks = start;
     int running = 1;
     while (running) {
+        Uint32 now_ticks;
+        double dt;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = 0;
@@ -776,16 +875,24 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                             ? TRACK_VIEW_DRIVE : TRACK_VIEW_TOP;
                     } else if (s_track_view_mode == TRACK_VIEW_DRIVE) {
                         switch (ev.key.keysym.sym) {
+                            case SDLK_p:
+                                if (!s_autopilot_on && s_autopilot_wp_count == 0) {
+                                    track_view_build_autopilot_path(track);
+                                }
+                                s_autopilot_on = !s_autopilot_on;
+                                break;
                             case SDLK_UP:
+                                s_autopilot_on = 0;
                                 s_cam_x += sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
                                 s_cam_z += cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
                                 break;
                             case SDLK_DOWN:
+                                s_autopilot_on = 0;
                                 s_cam_x -= sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
                                 s_cam_z -= cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
                                 break;
-                            case SDLK_LEFT:  s_cam_yaw -= TRACK_DRIVE_TURN_STEP; break;
-                            case SDLK_RIGHT: s_cam_yaw += TRACK_DRIVE_TURN_STEP; break;
+                            case SDLK_LEFT:  s_autopilot_on = 0; s_cam_yaw -= TRACK_DRIVE_TURN_STEP; break;
+                            case SDLK_RIGHT: s_autopilot_on = 0; s_cam_yaw += TRACK_DRIVE_TURN_STEP; break;
                             case SDLK_EQUALS: case SDLK_KP_PLUS:
                                 s_cam_height += TRACK_DRIVE_HEIGHT_STEP;
                                 if (s_cam_height > TRACK_DRIVE_HEIGHT_MAX) s_cam_height = TRACK_DRIVE_HEIGHT_MAX;
@@ -795,6 +902,7 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                                 if (s_cam_height < TRACK_DRIVE_HEIGHT_MIN) s_cam_height = TRACK_DRIVE_HEIGHT_MIN;
                                 break;
                             case SDLK_r:
+                                s_autopilot_on = 0;
                                 track_view_reset_drive(track);
                                 break;
                             default: break;
@@ -827,6 +935,13 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                     }
                 }
             }
+        }
+
+        now_ticks = SDL_GetTicks();
+        dt = (double)(now_ticks - last_ticks) / 1000.0;
+        last_ticks = now_ticks;
+        if (track != NULL && track->ready) {
+            track_view_autopilot_update(dt);
         }
 
         if (tex_page != NULL) {
