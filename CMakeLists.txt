@@ -15,9 +15,10 @@ add_executable(rr_pc_port
   src/ported_logic.c
   src/psx_compat/psx_bios.c
   src/gpu/gpu_soft.c
+  tools/texparse/tim.c
 )
 
-target_include_directories(rr_pc_port PRIVATE src)
+target_include_directories(rr_pc_port PRIVATE src tools/texparse)
 target_compile_options(rr_pc_port PRIVATE -Wall -Wextra)
 
 # Phase 3: headless sanity check for the software rasterizer, no SDL
@@ -63,6 +64,40 @@ add_executable(objparse_tool
 )
 target_include_directories(objparse_tool PRIVATE tools/mapparse)
 target_compile_options(objparse_tool PRIVATE -Wall -Wextra)
+
+# Texture reverse-engineering tool: standalone CLI, no game/PSX
+# dependencies. Parses a TEX*.TMS file (from the user's own local disc
+# extraction, never committed to this repo) -- a container of PS1 TIM
+# texture pages -- and prints/dumps its structure. See
+# tools/texparse/tim.h for the format writeup (confirmed vs. hypothesis,
+# clearly separated, plus a documented caveat about the pixmap length
+# field found via independent hex verification this round).
+add_executable(texparse_tool
+  tools/texparse/texparse_main.c
+  tools/texparse/tim.c
+)
+target_include_directories(texparse_tool PRIVATE tools/texparse)
+target_compile_options(texparse_tool PRIVATE -Wall -Wextra)
+
+# Headless proof-of-concept: decodes a real TEX*.TMS file via tim.c and
+# renders one page through gpu_draw_quad_textured() into the raw
+# framebuffer, then asserts the result actually varies (not all one
+# color) -- i.e. real game texture art made it through the whole
+# decode -> rasterize pipeline. Needs a real local texture file, which
+# is never committed to this repo, so this test SKIPS (exit 0) rather
+# than failing when the RR_TEX_FILE env var isn't set or doesn't point
+# at a readable file -- keeps `ctest` green in CI/sandboxes that don't
+# have the asset, while still giving a real, automatable check for
+# anyone who does (see README/task notes for how to point it at a real
+# TEX0.TMS locally).
+add_executable(rr_pc_port_texdemo_test
+  tools/texparse/texdemo_test.c
+  tools/texparse/tim.c
+  src/gpu/gpu_soft.c
+)
+target_include_directories(rr_pc_port_texdemo_test PRIVATE tools/texparse src/gpu)
+target_compile_options(rr_pc_port_texdemo_test PRIVATE -Wall -Wextra)
+add_test(NAME texdemo_headless_decode COMMAND rr_pc_port_texdemo_test)
 
 # SDL2 is optional: this is a HOST port scaffold, not the PSX cross build.
 # If SDL2 dev headers/libs aren't present, we build a headless binary that

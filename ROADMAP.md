@@ -568,6 +568,76 @@ Zero regressions: full build (`rr_pc_port`, `rr_pc_port_gpu_test`,
 `ctest` still 1/1 pass. `tools/rotation_fit/` is pure-Python and not
 part of the CMake build, so it can't break the C build.
 
+## Phase 5, round 8 -- the section-rotation mystery resolved via live dynamic debugging
+
+After 7 rounds of static analysis (6 RE + 1 empirical least-squares
+attempt) failed to locate any code that builds a per-section rotation
+matrix from MAP.RRM data, this round finally set up live dynamic
+debugging: PCSX-Redux's built-in GDB server (`Configuration ->
+Emulation -> Enable GDB Server`, port 3333) plus `gdb-multiarch`
+(connected via the WSL gateway IP, not `localhost`, which timed out --
+almost certainly a Windows Firewall interaction with the WSL virtual
+adapter). A hardware **read** watchpoint (`rwatch`) on the scratchpad
+pointer `DAT_1F80003C` -- identified back in round 6 as having zero
+static reads anywhere in the binary -- broke immediately and
+repeatedly during real gameplay, at PC `0x800437F4`.
+
+Tracing the call chain from that address (now documented in Ghidra,
+`DrawSectionRecords_fromDirTable_TranslateOnly` at `0x800437AC`) up
+through its caller's `$ra`, and one more hop up to the actual static
+caller `FUN_80012e44`, resolves the mystery completely: that function
+calls `SetRotMatrix(&DAT_801e91f0)` where `DAT_801e91f0` is
+*the live camera view matrix* (confirmed by xref -- it's written only
+by `BuildCameraViewMatrix_fromLiveEuler`, the same camera-Euler chain
+characterized in round 5), then draws each nearby section using a pure
+translation (`grid_cell*2048 - car_position`, rotated into camera
+space) with **no additional per-section rotation applied anywhere**.
+
+**Conclusion: there is no per-section rotation in this game's track
+rendering.** All 7 prior rounds were searching for a mechanism that
+does not exist in this form. What remains open (and is *not* explained
+by this finding) is why the round-6 "translation only" offline
+reconstruction still failed 94% of grid-adjacent junction checks --
+since the game itself only translates, the bug is presumably a scale
+or coordinate-interpretation mismatch in the offline parser/tools, not
+a missing rotation. Concrete next step for a future round: read the
+real in-memory record bytes right before the `RTPT` in
+`DrawSectionRecords_fromDirTable_TranslateOnly` via the same GDB setup
+and diff them against what `mapparse_tool` computes offline for the
+same section -- the discrepancy should point directly at the bug (a
+likely suspect: the game left-shifts the translation tuple by 2
+(`<<2`) before use, which may not be mirrored in the offline tooling).
+
+This is also the first round where the dynamic-debugging setup
+(PCSX-Redux GDB server + gdb-multiarch + a targeted watchpoint) proved
+itself as a fast, reusable technique for this project -- it resolved
+in one session what 7 rounds of pure static analysis could not.
+
+## Phase 3 milestone 3 -- real game textures decoded and rendered natively
+
+Reverse-engineered the `TEX0-4.TMS` texture container format (PS1 TIM
+pages with an extra 4-byte CD-streaming skip-length prefix per page)
+from the binary's texture-upload routine and cross-checked it against
+the real local files byte-for-byte. New standalone tool
+`tools/texparse/` (`tim.h`/`tim.c` decoder + `texparse_tool` CLI,
+mirroring the `tools/mapparse/` pattern -- reads a user-local
+`TEX*.TMS` path at runtime, nothing committed) decodes CLUT-indexed
+(4bpp/8bpp) and 16bpp-direct pages to RGBA. Verified against real data:
+TEX0.TMS parses cleanly into 143 pages, several visually confirmed
+(dumped locally, never committed) as recognizable game art -- a HUD
+font/text atlas, the Mappy mascot sprite, a NAMCO logo/plate texture.
+
+`src/gpu/gpu_soft.c` gained `gpu_draw_quad_textured()` (affine
+barycentric UV, nearest-neighbor sampling, alpha-keyed transparency),
+covered by new headless tests in `gpu_soft_test.c`. `src/main.c` now
+accepts an optional texture-file path argument and, when given one,
+decodes and renders a real texture page full-screen instead of the
+synthetic animated demo -- proving the full pipeline (real PS1 texture
+bytes -> decoded RGBA -> software-rasterized on a real PC window) end
+to end. No game assets committed anywhere; `rr_pc_port_texdemo_test`
+in CTest exercises the same path headlessly and no-ops cleanly in CI
+where no local asset path is configured.
+
 ## Phase 6 -- Audio
 
 SPU emulation or a from-scratch replacement audio engine, once there's
