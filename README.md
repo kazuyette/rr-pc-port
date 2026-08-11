@@ -7,11 +7,18 @@ itself (see that repo for the actual PS1 reverse engineering work) --
 it's the beginning of a separate, from-scratch effort to turn the
 portable pieces of that decomp into a real PC build.
 
-**Status: phase 1 (infrastructure + trivial vertical slice) only.** This
-is not a playable game, not a renderer, not close to one yet. See
-[ROADMAP.md](ROADMAP.md) for the honest, phased plan and the key finding
-that shapes it: only about 2.5% of the decomp's matched code is genuine
-portable C, the rest is byte-exact PS1 assembly transcription.
+**Status: playable race slice (phases 1-7, rounds 1-60).** The port now
+runs a full race on the real course: the authentic BAM12 fixed-point
+player physics (drift model, gearbox, walls, slope -- ported at
+instruction level from the decomp), 11 AI opponents driven by the game's
+own roster/grid/pace tables (extracted at runtime from the user's local
+PSX.EXE, never committed), the whole world rendered with real textures
+(recreated PS1 VRAM, per-quad UV/CLUT/TPAGE, cell placement PROVEN
+against the game's own streamer), the real HUD sprites (chrome digits +
+tachometer dial) and the actual engine/skid samples decoded from the VAB
+sound bank, pitch-driven by the authentic rpm. See
+[ROADMAP.md](ROADMAP.md) for the complete round-by-round log with its
+strict CONFIRMED-vs-APPROXIMATED provenance ledger.
 
 ## What's here
 
