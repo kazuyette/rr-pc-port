@@ -1,9 +1,11 @@
 # rr-pc-port roadmap
 
 This project is a from-scratch PC port scaffold derived from
-[rr-decomp](https://github.com/kazuyette/rr-decomp), a completed(-ish) PS1
-decompilation of Ridge Racer (1994, Namco): 948/949 functions matched,
-99.93% of the original binary's bytes.
+[rr-decomp](https://github.com/kazuyette/rr-decomp), a byte-matched PS1
+reconstruction of Ridge Racer (1994, Namco): 949/949 functions matched,
+100% of the original binary's bytes -- but NOT, in community terms, a
+completed decompilation (63 functions in real C; see below, which this
+roadmap has always been explicit about).
 
 ## The key scoping fact
 
@@ -1877,3 +1879,38 @@ remapping UI, packaging/distribution. None of this matters until phases
   carrosserie au rendu joueur, ET son propre sample moteur VAG rechargé
   (programme = id modèle). Les captures selfdrive font défiler le salon
   (60 frames titre + 90 frames de modèles en rotation) avant la course.
+
+- **Round 63 — build Windows natif + bundle prêt-à-jouer.** Cross-compilation
+  mingw-w64 (toolchain-mingw.cmake dans build-win/, SDL2-devel 2.30.9 mingw) :
+  rr_pc_port.exe (383 Ko) sorti au premier essai, zéro warning. Smoke test
+  sous wine : tous les auto-tests de logique portée passent, piste chargée
+  (258 sections / 6737 records), selfdrive capture des frames, exit 0.
+  Bundle livré (RidgeRacer-PC-win64.zip, 2,2 Mo) : exe + SDL2.dll + gamedata\
+  (les 11 fichiers extraits du disque de l'utilisateur, jamais dans le dépôt)
+  + RUN.bat + LISEZMOI.txt. Première fois que le port est jouable sur la
+  machine Windows de son auteur.
+
+- **Round 64 — manette + chrono au tour.** Support SDL_GameController
+  fondu dans la boucle existante (chemin menu partagé clavier/manette
+  via game_menu_advance) : gâchettes = accél/frein, stick gauche ou
+  croix = volant au seuil tout-ou-rien de l'original, RB/LB = boîte
+  (le premier passage latche la manuelle, Y rend l'auto), A/Start =
+  menus, hot-plug géré. Chrono authentique compté en pas physiques
+  30 Hz (centisecondes exactes en entier), affiché M'SS"CC en chiffres
+  chrome TEX0 avec ticks ' et " dessinés ; tour courant + tour
+  précédent en course, récap L1..L3 + total sur l'écran de résultat.
+  Rebuild Linux (0 warning, 5/5 ctest) + Windows (wine OK), bundle v2
+  livré avec la notice manette.
+
+- **Round 65 — écran de mode + voiture secrète.** Nouvel état titre →
+  MODE → sélection → course. Les 4 lignes branchent les vraies tables
+  du EXE, toutes mises en cache au chargement (psx_ai_apply_mode) :
+  GP = allures D_80073560, GP EXPERT = D_80073680, GP MASTER =
+  D_800737A0, DUEL = roster D_80073160 ({2, −1×10, 12} vérifié : la
+  rivale secrète seule en piste) ; gauche/droite bascule la famille
+  miroir D_80073B00/C20/D40. Gagner le DUEL débloque le 13e modèle
+  (voiture secrète 12, objets 252/253/256) dans la sélection. Départ
+  de course = reset complet (IA re-seedée sur le setup appliqué,
+  chrono, tours, position) donc les courses s'enchaînent proprement.
+  Microfont étendue (16 lettres) + hud_text pour l'écran de mode.
+  0 warning, 5/5 ctest, wine OK, bundle v3 livré.

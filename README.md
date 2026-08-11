@@ -1,11 +1,15 @@
 # rr-pc-port
 
 A from-scratch PC port scaffold derived from
-[rr-decomp](https://github.com/kazuyette/rr-decomp), a Ridge Racer (1994,
-Namco, PS1) decompilation. This repo does **not** contain the decomp
-itself (see that repo for the actual PS1 reverse engineering work) --
-it's the beginning of a separate, from-scratch effort to turn the
-portable pieces of that decomp into a real PC build.
+[rr-decomp](https://github.com/kazuyette/rr-decomp), a byte-matched
+reconstruction of Ridge Racer (1994, Namco, PS1) whose source-level
+decompilation is still in progress (63 of 949 functions in real C so
+far -- the rest are verbatim `__asm__` transcriptions; see that repo's
+Status section for the precise terminology). This repo does **not**
+contain the reconstruction itself -- it's a separate effort to
+re-derive portable real C for the game's logic, verified against the
+original behavior (and, for functions landed back into rr-decomp,
+byte-verified with objdiff).
 
 **Status: playable race slice (phases 1-7, rounds 1-60).** The port now
 runs a full race on the real course: the authentic BAM12 fixed-point
