@@ -2,6 +2,7 @@
  * instruction-level trace of func_80025268 + callees vs. what is
  * approximated until func_80023C58 / the race-setup tables fall). */
 #include "psx_ai.h"
+#include <string.h>
 
 #include <math.h>
 
@@ -42,60 +43,82 @@ int psx_ai_kit_from_exe(const uint8_t *exe, size_t size)
 
 PsxAiSlotSetup psx_ai_setup[12];
 int psx_ai_setup_loaded = 0;
+int psx_ai_mode = 0;
+int psx_ai_mirror = 0;
 
-int psx_ai_race_from_exe(const uint8_t *exe, size_t size)
+/* ROUND 65: ALL the race-setup table variants, cached from the EXE at
+ * load time so the mode screen can rebuild the setup with no file in
+ * hand. Rosters: D_80073130 (normal, 11 cars) / D_80073160 (mode 4,
+ * the secret-rival duel). Pace tables (24B x 12 each): modes 0/2/3 at
+ * D_80073560/D_80073680/D_800737A0, mirror variants at
+ * D_80073B00/D_80073C20/D_80073D40 (both families found round 55).
+ * The grid D_800731C0 is shared by every mode. */
+static uint8_t s_roster_tab[2][48];
+static uint8_t s_grid_tab[192];
+static uint8_t s_pace_tab[6][288];
+static int s_tabs_cached = 0;
+
+static int32_t rd32s(const uint8_t *p)
 {
-    /* RAM->file: -0x80010000 + 0x800. Roster D_80073130 (12 x int32),
-     * grid D_800731C0 (12 x 16B, +0xC = start progress section<<8),
-     * pace D_80073560 (12 x 24B, +0x4 = cruise limit / 8, AI units).
-     * The player grids at section 68 (grid slot 0's progress). */
-    size_t roster = 0x80073130 - 0x80010000 + 0x800;
-    size_t grid = 0x800731C0 - 0x80010000 + 0x800;
-    size_t pace = 0x80073560 - 0x80010000 + 0x800;
+    return (int32_t)(p[0] | (p[1] << 8) | (p[2] << 16) |
+                     ((uint32_t)p[3] << 24));
+}
+
+int psx_ai_apply_mode(int mode, int mirror)
+{
+    const uint8_t *roster = s_roster_tab[mode == 4 ? 1 : 0];
+    int pi = (mode == 2) ? 1 : (mode == 3) ? 2 : 0;
+    const uint8_t *pace;
     int32_t player_start;
     int s;
-    if (size < pace + 12 * 24)
+    if (!s_tabs_cached)
         return 0;
-    player_start = (int32_t)(exe[grid + 12] | (exe[grid + 13] << 8) |
-                             (exe[grid + 14] << 16) | (exe[grid + 15] << 24));
+    if (mirror)
+        pi += 3;
+    pace = s_pace_tab[pi];
+    player_start = rd32s(s_grid_tab + 12);
     for (s = 0; s < 12; s++) {
-        int32_t model = (int32_t)(exe[roster + s * 4] |
-                                  (exe[roster + s * 4 + 1] << 8) |
-                                  (exe[roster + s * 4 + 2] << 16) |
-                                  (exe[roster + s * 4 + 3] << 24));
-        int32_t prog = (int32_t)(exe[grid + s * 16 + 12] |
-                                 (exe[grid + s * 16 + 13] << 8) |
-                                 (exe[grid + s * 16 + 14] << 16) |
-                                 (exe[grid + s * 16 + 15] << 24));
-        int32_t lim = (int32_t)(exe[pace + s * 24 + 4] |
-                                (exe[pace + s * 24 + 5] << 8) |
-                                (exe[pace + s * 24 + 6] << 16) |
-                                (exe[pace + s * 24 + 7] << 24));
-        int32_t acc = (int32_t)(exe[pace + s * 24 + 12] |
-                                (exe[pace + s * 24 + 13] << 8) |
-                                (exe[pace + s * 24 + 14] << 16) |
-                                (exe[pace + s * 24 + 15] << 24));
-        int32_t gx = (int32_t)(exe[grid + s * 16] | (exe[grid + s * 16 + 1] << 8) |
-                               (exe[grid + s * 16 + 2] << 16) | (exe[grid + s * 16 + 3] << 24));
-        int32_t gz = (int32_t)(exe[grid + s * 16 + 4] | (exe[grid + s * 16 + 5] << 8) |
-                               (exe[grid + s * 16 + 6] << 16) | (exe[grid + s * 16 + 7] << 24));
-        psx_ai_setup[s].model = model;
-        psx_ai_setup[s].start_rel = (double)(prog - player_start) / 256.0;
-        psx_ai_setup[s].limit = lim * 64; /* AI units *8, x8 to player */
-        psx_ai_setup[s].accel = acc;
+        psx_ai_setup[s].model = rd32s(roster + s * 4);
+        psx_ai_setup[s].start_rel =
+            (double)(rd32s(s_grid_tab + s * 16 + 12) - player_start) / 256.0;
+        psx_ai_setup[s].limit = rd32s(pace + s * 24 + 4) * 64;
+        psx_ai_setup[s].accel = rd32s(pace + s * 24 + 12);
         /* ROUND 56: grid x/z are in the game's MESH/GTE frame; the
          * physics frame is x_phys = 0xF000 - x_mesh (D_801733A0 =
          * 0xF000, func_80015CD4 -- and the slot-0 cross-check:
          * 61440 - sec68.x(34604) = 26836 ~ grid.x 27126, the delta
          * being exactly the grid lane). */
-        psx_ai_setup[s].grid_x = 61440.0 - (double)gx;
-        psx_ai_setup[s].grid_z = (double)gz;
+        psx_ai_setup[s].grid_x = 61440.0 - (double)rd32s(s_grid_tab + s * 16);
+        psx_ai_setup[s].grid_z = (double)rd32s(s_grid_tab + s * 16 + 4);
     }
-    /* sanity: roster slot 0 is model 2 on the retail EXE */
-    if (psx_ai_setup[0].model != 2)
-        return 0;
+    psx_ai_mode = mode;
+    psx_ai_mirror = mirror;
     psx_ai_setup_loaded = 1;
     return 1;
+}
+
+int psx_ai_race_from_exe(const uint8_t *exe, size_t size)
+{
+    /* RAM->file: -0x80010000 + 0x800. See the table map above; the
+     * player grids at section 68 (grid slot 0's progress). */
+    static const size_t pace_addr[6] = {
+        0x80073560, 0x80073680, 0x800737A0,
+        0x80073B00, 0x80073C20, 0x80073D40
+    };
+    size_t base = 0x80010000 - 0x800;
+    int i;
+    if (size < 0x80073D40 - base + 288)
+        return 0;
+    memcpy(s_roster_tab[0], exe + (0x80073130 - base), 48);
+    memcpy(s_roster_tab[1], exe + (0x80073160 - base), 48);
+    memcpy(s_grid_tab, exe + (0x800731C0 - base), 192);
+    for (i = 0; i < 6; i++)
+        memcpy(s_pace_tab[i], exe + (pace_addr[i] - base), 288);
+    /* sanity: normal roster slot 0 is model 2 on the retail EXE */
+    if (rd32s(s_roster_tab[0]) != 2)
+        return 0;
+    s_tabs_cached = 1;
+    return psx_ai_apply_mode(0, 0);
 }
 
 int32_t psx_ai_blend_angle(int32_t a, int32_t b, int32_t w)

@@ -446,6 +446,8 @@ static void integrate(PsxCar *car, const PsxTrackIface *trk)
     int32_t nz = car->pos_z + (car->vel_z >> 8);
     int wall = 0;
 
+    car->wall_scrape = 0; /* ROUND 66: SFX hook, set in the wall branch */
+
     if (trk && trk->wall_blocked)
         wall = trk->wall_blocked(trk->ctx, car->pos_x, car->pos_z, nx, nz);
 
@@ -480,6 +482,8 @@ static void integrate(PsxCar *car, const PsxTrackIface *trk)
          * along the wall instead of freezing; that resolver is not
          * line-traced yet, so this port approximates the slide with a
          * classic axis-separated retry (documented approximation). */
+        car->wall_scrape = 1; /* ROUND 66: the original fires its
+                                  scrape SFX from this same branch */
         car->speed = car->speed * 70 / 100;
         car->aux_speed = car->aux_speed * 80 / 100;
         /* the original's drive handler rebuilds the velocity vector

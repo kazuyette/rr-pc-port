@@ -136,7 +136,14 @@ typedef struct {
 } PsxAiSlotSetup;
 extern PsxAiSlotSetup psx_ai_setup[12];
 extern int psx_ai_setup_loaded;
+/* ROUND 65: currently applied mode (0 GP / 2 fast / 3 fastest /
+ * 4 secret-rival duel) and mirror-pace flag. */
+extern int psx_ai_mode;
+extern int psx_ai_mirror;
 int psx_ai_race_from_exe(const uint8_t *exe, size_t size);
+/* Rebuilds psx_ai_setup from the cached EXE tables for a mode; call
+ * psx_ai_race_from_exe once first. Returns 1 on success. */
+int psx_ai_apply_mode(int mode, int mirror);
 
 /* Extracts D_80059228 from a raw PSX.EXE buffer (RAM 0x80059228 ->
  * file 0x49A28 for the retail EXE mapped at 0x80010000 with a 0x800

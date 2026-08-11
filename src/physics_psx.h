@@ -54,6 +54,10 @@ typedef struct {
                                              SITE WAS FOUND THIS ROUND (see .c) */
     int32_t vel_ang;               /* +0xA8  atan2 of velocity (polar) */
     int32_t aux_speed;             /* +0xB0  secondary speed scalar (x0.8 on wall) */
+    int32_t wall_scrape;           /* ROUND 66 (port-side): 1 while this frame's
+                                      predicted position hit a wall -- the
+                                      original fires its scrape/impact SFX from
+                                      the same branch (see integrate()) */
     int32_t spin_state;            /* +0xB4  0 normal; 1 spin-out; 3 blocks gearbox */
     int32_t airborne;              /* +0xB8  nonzero while in the air */
     int32_t air_timer;             /* +0xBA  frames airborne */

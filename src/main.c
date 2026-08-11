@@ -551,6 +551,36 @@ static int s_title_active = 1; /* ROUND 61: interactive boot state --
 static int s_title_frame = 0;
 static int s_select_active = 0; /* ROUND 62: car-select state (after
                                    title, before the race) */
+/* ROUND 65: mode-select state (between title and car select). The
+ * four rows map to the EXE's real setup variants: GP = pace
+ * D_80073560, GP EXPERT = D_80073680, GP MASTER = D_800737A0, DUEL =
+ * roster D_80073160 (the secret rival). MIROIR swaps in the mirror
+ * pace family D_80073B00/C20/D40. */
+static int s_mode_active = 0;
+static int s_mode_sel = 0;              /* row 0..3 */
+static int s_mode_mirror = 0;
+static const int k_mode_ids[4] = { 0, 2, 3, 4 };
+static int s_race_mode = 0;             /* applied at race start */
+static int s_secret_unlocked = 0;       /* car 13 (model 12): win the duel */
+
+/* ROUND 64: lap chrono -- counted in 30Hz physics steps (the game's
+ * own frame unit), converted to M'SS"CC only at draw time so no float
+ * drift accumulates. Up to 8 laps stored (a 3-lap race uses 3). */
+static int s_lap_frames = 0;
+static int s_lap_times[8];
+static int s_lap_time_count = 0;
+/* ROUND 64: gamepad (SDL_GameController). Opened at startup or on
+ * hot-plug; NULL = keyboard only. s_pad_manual latches on when the
+ * player first uses the shoulder shifters (Y toggles back to auto). */
+static SDL_GameController *s_pad = NULL;
+static int s_pad_manual = 0;
+
+static void chrono_lap_wrap(void)
+{
+    if (s_lap_time_count < 8)
+        s_lap_times[s_lap_time_count++] = s_lap_frames;
+    s_lap_frames = 0;
+}
 
 static void ai_step_and_fill(PsxBridge *br, double player_progress,
                              int obj_ready)
@@ -595,8 +625,15 @@ static void ai_step_and_fill(PsxBridge *br, double player_progress,
                 ahead++;
         }
         s_race_pos = 1 + ahead;
-        if (s_hud_lap >= 3)
+        if (s_hud_lap >= 3) {
             s_race_over = 1;
+            /* ROUND 65: winning the DUEL unlocks the 13th car (the
+             * secret model 12 -- the rival you just beat). */
+            if (s_race_pos == 1 && s_race_mode == 4 && !s_secret_unlocked) {
+                s_secret_unlocked = 1;
+                printf("secret car unlocked (model 13)\n");
+            }
+        }
     }
 }
 
@@ -608,7 +645,7 @@ static void ai_step_and_fill(PsxBridge *br, double player_progress,
  * round); the VALUES are the authentic ones: km/h = speed * 33/100
  * (0x2C3 top speed ~ 232 km/h, matching the original's readout),
  * gear from the authentic gearbox, lap from the section wrap. */
-static const uint8_t k_hudfont[16][6] = {
+static const uint8_t k_hudfont[32][6] = {
     { 0xF, 0x9, 0x9, 0x9, 0x9, 0xF }, /* 0 */
     { 0x2, 0x6, 0x2, 0x2, 0x2, 0x7 }, /* 1 */
     { 0xF, 0x1, 0xF, 0x8, 0x8, 0xF }, /* 2 */
@@ -625,6 +662,24 @@ static const uint8_t k_hudfont[16][6] = {
     { 0xF, 0x8, 0x8, 0x8, 0x8, 0xF }, /* C (unused) */
     { 0x8, 0x8, 0x8, 0x8, 0x8, 0xF }, /* L */
     { 0x0, 0x0, 0x0, 0x6, 0x6, 0x0 }, /* . */
+    /* ROUND 65: the letters the mode-select rows need (same 4x6
+     * microfont style; indices via the hud_text map below). */
+    { 0x6, 0x9, 0xF, 0x9, 0x9, 0x9 }, /* 16 A */
+    { 0xE, 0x9, 0x9, 0x9, 0x9, 0xE }, /* 17 D */
+    { 0xF, 0x8, 0xE, 0x8, 0x8, 0xF }, /* 18 E */
+    { 0xF, 0x8, 0x8, 0xB, 0x9, 0xF }, /* 19 G */
+    { 0x7, 0x2, 0x2, 0x2, 0x2, 0x7 }, /* 20 I */
+    { 0x9, 0xD, 0xD, 0xB, 0xB, 0x9 }, /* 21 N */
+    { 0x6, 0x9, 0x9, 0x9, 0x9, 0x6 }, /* 22 O */
+    { 0xF, 0x9, 0xF, 0x8, 0x8, 0x8 }, /* 23 P */
+    { 0xF, 0x9, 0xF, 0xA, 0x9, 0x9 }, /* 24 R */
+    { 0x7, 0x8, 0x6, 0x1, 0x1, 0xE }, /* 25 S */
+    { 0x7, 0x2, 0x2, 0x2, 0x2, 0x2 }, /* 26 T */
+    { 0x9, 0x9, 0x9, 0x9, 0x9, 0xF }, /* 27 U */
+    { 0x9, 0x9, 0x9, 0x9, 0xA, 0x4 }, /* 28 V */
+    { 0x9, 0x9, 0x6, 0x6, 0x9, 0x9 }, /* 29 X */
+    { 0xF, 0x8, 0xE, 0x8, 0x8, 0x8 }, /* 30 F */
+    { 0x2, 0x5, 0x5, 0x2, 0x0, 0x0 }, /* 31 degree/dot (spare) */
 };
 
 static void hud_glyph(int gx, int gy, int glyph, int scale, uint32_t col)
@@ -641,6 +696,28 @@ static void hud_glyph(int gx, int gy, int glyph, int scale, uint32_t col)
                         gpu_framebuffer[py * GPU_FB_WIDTH + px] = col;
                 }
         }
+}
+
+/* ROUND 65: microfont text -- maps A-Z/0-9 to k_hudfont indices
+ * (unmapped letters advance blank). Shadowed like hud_number. */
+static void hud_text(int x, int y, const char *s, int scale, uint32_t col)
+{
+    static const int8_t k_letter[26] = {
+        16, -1, 13, 17, 18, 30, 19, 12, 20, -1, 10, 14, 11,
+        21, 22, 23, -1, 24, 25, 26, 27, 28, -1, 29, -1, -1
+    };
+    int gx = x;
+    for (; *s != 0; s++) {
+        int g = -1;
+        if (*s >= '0' && *s <= '9') g = *s - '0';
+        else if (*s >= 'A' && *s <= 'Z') g = k_letter[*s - 'A'];
+        else if (*s == '.') g = 15;
+        if (g >= 0) {
+            hud_glyph(gx + scale, y + scale, g, scale, 0xFF000000u);
+            hud_glyph(gx, y, g, scale, col);
+        }
+        gx += 5 * scale;
+    }
 }
 
 /* ROUND 55: REAL glyphs -- TEX0 page 0 is the game's HUD sprite
@@ -881,10 +958,16 @@ static void draw_car_select(int frame, int model)
         for (x = 0; x < GPU_FB_WIDTH; x++)
             gpu_framebuffer[y * GPU_FB_WIDTH + x] = c;
     }
-    for (pi = 0; pi < 3; pi++) {
+    for (pi = 0; pi < 5; pi++) {
         const PsxCarKit *kt = &psx_ai_kit[model];
-        int obj = pi == 0 ? kt->body_obj : kt->axle_obj;
+        /* ROUND 66: pieces 3/4 are the aux+2/aux+3 glass companions */
+        int obj = pi == 0 ? kt->body_obj
+                : pi <= 2 ? kt->axle_obj
+                : kt->aux_obj + pi - 1;
         int dz = pi == 2 ? kt->axle_dz_model : 0;
+        if (pi >= 3 && (obj <= 0 || (uint32_t)obj >= s_obj_count ||
+                        obj_cnt((uint32_t)obj, 2) <= 0))
+            continue;
         int16_t n64;
         uint32_t base, o;
         if (obj < 0 || (uint32_t)obj >= s_obj_count)
@@ -930,6 +1013,39 @@ static void draw_car_select(int frame, int model)
             sq->depth = avg / 4.0;
             nq++;
         }
+        /* ROUND 66: the piece's type-2 flat quads (glass/underbody) */
+        {
+            int16_t n2p = obj_cnt((uint32_t)obj, 2);
+            uint32_t o2p = base + (uint32_t)obj_cnt(obj, 0) * 40u
+                                + (uint32_t)obj_cnt(obj, 1) * 48u;
+            for (k = 0; k < n2p && nq < 512; k++) {
+                const uint8_t *rec = s_obj_buf + o2p + (uint32_t)k * 32u;
+                SelQuad *sq = &q[nq];
+                double avg = 0.0;
+                int c2, r = rec[24], g = rec[25], b2 = rec[26];
+                if (r + g + b2 < 24) { r = 0x18; g = 0x1C; b2 = 0x26; }
+                sq->mod = ((uint32_t)r << 16) | ((uint32_t)g << 8) |
+                          (uint32_t)b2;
+                sq->pg = NULL;
+                for (c2 = 0; c2 < 4; c2++) {
+                    int vi = (c2 == 0) ? 0 : (c2 == 1) ? 1 : (c2 == 2) ? 3 : 2;
+                    int16_t mx = (int16_t)(rec[vi * 6] | (rec[vi * 6 + 1] << 8));
+                    int16_t my = (int16_t)(rec[vi * 6 + 2] | (rec[vi * 6 + 3] << 8));
+                    int16_t mz = (int16_t)(rec[vi * 6 + 4] | (rec[vi * 6 + 5] << 8));
+                    double pmz = -(double)mz + dz, pmy = (double)my, pmx = (double)mx;
+                    double rx = pmz * cy - pmx * sy;
+                    double rz = pmz * sy + pmx * cy;
+                    double depth = 1600.0 + rz;
+                    sq->x[c2] = GPU_FB_WIDTH / 2 + (int)(rx * 340.0 / depth);
+                    sq->y[c2] = 150 + (int)((pmy + 130.0) * 340.0 / depth);
+                    sq->u[c2] = 0.0f;
+                    sq->v[c2] = 0.0f;
+                    avg += depth;
+                }
+                sq->depth = avg / 4.0 - 1.0; /* just over the shell */
+                nq++;
+            }
+        }
     }
     /* painter sort, far first */
     for (k = 0; k < nq; k++) {
@@ -944,9 +1060,42 @@ static void draw_car_select(int frame, int model)
                                        q[k].x[2], q[k].y[2], q[k].u[2], q[k].v[2],
                                        q[k].x[3], q[k].y[3], q[k].u[3], q[k].v[3],
                                        q[k].pg, 256, 256, q[k].mod);
+        else
+            gpu_draw_quad_flat(q[k].x[0], q[k].y[0], q[k].x[1], q[k].y[1],
+                               q[k].x[2], q[k].y[2], q[k].x[3], q[k].y[3],
+                               q[k].mod); /* ROUND 66: glass quads */
     }
     /* header: CAR + number */
     hud_number(GPU_FB_WIDTH / 2 - 10, 16, model + 1, 4, 0x00FFD830);
+}
+
+/* ROUND 65: the mode screen (title -> HERE -> car select). Rows are
+ * the EXE's real setup variants (see the s_mode_active comment);
+ * left/right toggles the mirror pace family. */
+static void draw_mode_select(int frame, int sel, int mirror)
+{
+    static const char *rows[4] = { "GP", "GP EXPERT", "GP MASTER", "DUEL" };
+    int y, x, i;
+    for (y = 0; y < GPU_FB_HEIGHT; y++) {
+        int shade = 12 + y * 40 / GPU_FB_HEIGHT;
+        uint32_t c = ((uint32_t)shade << 16) |
+                     ((uint32_t)(shade / 2) << 8) | (uint32_t)shade;
+        for (x = 0; x < GPU_FB_WIDTH; x++)
+            gpu_framebuffer[y * GPU_FB_WIDTH + x] = c;
+    }
+    hud_text(GPU_FB_WIDTH / 2 - 40, 24, "MODE", 4, 0x00F0F0F0);
+    for (i = 0; i < 4; i++) {
+        int ry = 88 + i * 26;
+        uint32_t col = 0x00909098;
+        if (i == sel) {
+            col = ((frame / 8) & 1) ? 0x00FFD830 : 0x00FFF0A0;
+            hud_glyph(GPU_FB_WIDTH / 2 - 92, ry + 6, 15, 3, col);
+        }
+        hud_text(GPU_FB_WIDTH / 2 - 74, ry, rows[i], 3, col);
+    }
+    hud_text(GPU_FB_WIDTH / 2 - 74, 204, "MIROIR", 2, 0x00C0C0C0);
+    hud_text(GPU_FB_WIDTH / 2 + 0, 204, mirror ? "ON" : "OFF", 2,
+             mirror ? 0x00FFD830 : 0x00909098);
 }
 
 static int hud_number_width(int value, int scale)
@@ -963,6 +1112,55 @@ static int hud_number_width(int value, int scale)
         return w;
     }
     return n * 5 * scale;
+}
+
+/* ROUND 64: one digit with both render paths (authentic TEX0 sprite
+ * when VRAM is up, microfont fallback otherwise); returns advance. */
+static int hud_digit_adv(int x, int y, int d, int scale, uint32_t col)
+{
+    if (s_vram_loaded) {
+        int sc = scale >= 2 ? scale / 2 : 1;
+        return hud_sprite_digit(x, y, d, sc, col);
+    }
+    hud_glyph(x + scale, y + scale, d, scale, 0xFF000000u);
+    hud_glyph(x, y, d, scale, col);
+    return 5 * scale;
+}
+
+/* ROUND 64: chrono tick marks -- the ' and " separators of the
+ * original M'SS"CC lap readout, drawn as small chrome bars (the sheet
+ * has no dedicated glyph at the digit row). Returns advance. */
+static int hud_time_tick(int x, int y, int n, int scale, uint32_t col)
+{
+    int sc = scale >= 2 ? scale / 2 : 1;
+    int w = 2 * sc, h = 6 * sc, gap = 2 * sc, i, px, py;
+    for (i = 0; i < n; i++)
+        for (py = 0; py < h; py++)
+            for (px = 0; px < w; px++) {
+                int X = x + i * (w + gap) + px, Y = y + py;
+                if (X >= 0 && X < GPU_FB_WIDTH && Y >= 0 && Y < GPU_FB_HEIGHT)
+                    gpu_framebuffer[Y * GPU_FB_WIDTH + X] = col;
+            }
+    return n * w + (n - 1) * gap + 3 * sc;
+}
+
+/* ROUND 64: M'SS"CC lap time from 30Hz physics frames (centiseconds
+ * = frames*100/30, exact in integer math). */
+static void hud_time(int x, int y, int frames, int scale, uint32_t col)
+{
+    long cs = (long)frames * 100 / 30;
+    int m = (int)(cs / 6000), s = (int)((cs / 100) % 60), c = (int)(cs % 100);
+    int gx = x;
+    if (m > 99) m = 99;
+    if (m >= 10)
+        gx += hud_digit_adv(gx, y, (m / 10) % 10, scale, col);
+    gx += hud_digit_adv(gx, y, m % 10, scale, col);
+    gx += hud_time_tick(gx, y, 1, scale, col);
+    gx += hud_digit_adv(gx, y, s / 10, scale, col);
+    gx += hud_digit_adv(gx, y, s % 10, scale, col);
+    gx += hud_time_tick(gx, y, 2, scale, col);
+    gx += hud_digit_adv(gx, y, c / 10, scale, col);
+    gx += hud_digit_adv(gx, y, c % 10, scale, col);
 }
 
 static void draw_race_hud(int32_t speed_raw, int gear, int lap, int32_t rpm)
@@ -986,6 +1184,11 @@ static void draw_race_hud(int32_t speed_raw, int gear, int lap, int32_t rpm)
     /* lap counter "L n", top-left */
     hud_glyph(12, 12, 14, 3, white);
     hud_number(12 + 18, 10, lap, 3, yellow);
+    /* ROUND 64: current lap chrono under the lap counter, plus the
+     * previous lap's time in yellow below it once one exists. */
+    hud_time(12, 42, s_lap_frames, 2, white);
+    if (s_lap_time_count > 0 && !s_race_over)
+        hud_time(12, 72, s_lap_times[s_lap_time_count - 1], 2, yellow);
     /* ROUND 57: the real tachometer, bottom-left like the original */
     draw_tachometer(8, GPU_FB_HEIGHT - 96, rpm);
     /* ROUND 61: live race position, RR style -- big digit + ordinal
@@ -1013,6 +1216,20 @@ static void draw_race_hud(int32_t speed_raw, int gear, int lap, int32_t rpm)
             hud_sprite_blit(50, 90, HUD_TPAGE, HUD_CLUT, SPR_3RD, 2);
         } else {
             hud_number(110, 90, s_race_pos, 6, yellow);
+        }
+        /* ROUND 64: lap-time recap + total, right side of the result
+         * screen (L1..Ln in white, total in yellow underneath). */
+        {
+            int li, ty = 150, total = 0;
+            for (li = 0; li < s_lap_time_count; li++) {
+                hud_glyph(GPU_FB_WIDTH - 190, ty + 4, 14, 2, white);
+                hud_number(GPU_FB_WIDTH - 178, ty + 2, li + 1, 2, white);
+                hud_time(GPU_FB_WIDTH - 156, ty, s_lap_times[li], 2, white);
+                total += s_lap_times[li];
+                ty += 28;
+            }
+            if (s_lap_time_count > 0)
+                hud_time(GPU_FB_WIDTH - 156, ty + 4, total, 2, yellow);
         }
     }
 }
@@ -1797,7 +2014,7 @@ static void draw_track_drive_scene(const TrackDemo *td) {
          * once at the rear offset the table stores, the far LOD
          * object beyond Manhattan camera distance 0xD00, and a full
          * cull past 0x2500. */
-        struct { int obj; int dz; int dy; int spin; } pieces[3];
+        struct { int obj; int dz; int dy; int spin; } pieces[5];
         int pi, npieces;
         /* ROUND 53: model z runs NOSE-BACKWARD relative to our world
          * forward -- drawing it raw showed the nose to the chase
@@ -1832,6 +2049,25 @@ static void draw_track_drive_scene(const TrackDemo *td) {
                 pieces[2].dz = kt->axle_dz_model; /* rear (-335 etc.) */
                 pieces[2].dy = -14; pieces[2].spin = 1;
                 npieces = 3;
+                /* ROUND 66: the glass/underbody companions -- the
+                 * class kit's aux+2/aux+3 objects hold each car's
+                 * type-2 flat quads (canopy glass, underbody plate):
+                 * classes A/B/C = objects 3/4, 9/10, 19/20, secret
+                 * car = 254 (guarded by an actual type-2 count). */
+                {
+                    int gi;
+                    for (gi = 2; gi <= 3; gi++) {
+                        int go = kt->aux_obj + gi;
+                        if (go > 0 && (uint32_t)go < s_obj_count &&
+                            obj_cnt((uint32_t)go, 2) > 0) {
+                            pieces[npieces].obj = go;
+                            pieces[npieces].dz = 0;
+                            pieces[npieces].dy = 0;
+                            pieces[npieces].spin = 0;
+                            npieces++;
+                        }
+                    }
+                }
             }
         } else {
             /* no kit (no --physicsdata): round-52 fallback */
@@ -1949,6 +2185,78 @@ static void draw_track_drive_scene(const TrackDemo *td) {
                 njobs++;
             }
         }
+        /* ROUND 66: type-2 FLAT quads (POLY_F4, code 0x29 = semi-
+         * transparent in the original) -- the glass canopy and
+         * underbody plates. Same transform chain as above, no
+         * texture/normals; near-black glass records lift to a smoked
+         * blue-grey so the canopy reads against the body. */
+        {
+            int16_t n2p = obj_cnt((uint32_t)piece_model, 2);
+            uint32_t o2p = base + (uint32_t)obj_cnt(piece_model, 0) * 40u
+                                + (uint32_t)obj_cnt(piece_model, 1) * 48u;
+            for (k = 0; k < n2p && njobs < TRACK_DRIVE_MAX_QUADS; k++) {
+                const uint8_t *rec = s_obj_buf + o2p + (uint32_t)k * 32u;
+                double wr[4], wh[4], wd[4];
+                int c2, behind2 = 0;
+                double avg2 = 0.0;
+                uint32_t fcol;
+                {
+                    int r = rec[24], g = rec[25], b = rec[26];
+                    if (r + g + b < 24) { r = 0x18; g = 0x1C; b = 0x26; }
+                    fcol = ((uint32_t)r << 16) | ((uint32_t)g << 8) |
+                           (uint32_t)b;
+                }
+                for (c2 = 0; c2 < 4; c2++) {
+                    int vi = (c2 == 0) ? 0 : (c2 == 1) ? 1 : (c2 == 2) ? 3 : 2;
+                    int16_t mx = (int16_t)(rec[vi * 6] | (rec[vi * 6 + 1] << 8));
+                    int16_t my = (int16_t)(rec[vi * 6 + 2] | (rec[vi * 6 + 3] << 8));
+                    int16_t mz = (int16_t)(rec[vi * 6 + 4] | (rec[vi * 6 + 5] << 8));
+                    double pmx = (double)mx, pmy = (double)my, pmz = -(double)mz;
+                    pmz += (double)pieces[pi].dz;
+                    pmy += (double)pieces[pi].dy;
+                    if (cd->roll != 0) {
+                        double rx = pmx * crl - pmy * srl;
+                        double ry2 = pmx * srl + pmy * crl;
+                        pmx = rx; pmy = ry2;
+                    }
+                    {
+                        double lx = pmx * s_car_model_scale;
+                        double ly = pmy * s_car_model_scale;
+                        double lz = pmz * s_car_model_scale;
+                        double wx = cd->x + lz * ch2 - lx * sh2;
+                        double wz = cd->z + lz * sh2 + lx * ch2;
+                        double wy = (ci == 0 ? s_ground_y : cd->y) + ly - 6.0;
+                        double dx = wx - s_cam_x, dz2 = wz - s_cam_z;
+                        wr[c2] = dx * cos_yaw - dz2 * sin_yaw;
+                        wd[c2] = dx * sin_yaw + dz2 * cos_yaw;
+                        wh[c2] = (wy - s_ground_y) + s_cam_height;
+                        if (wd[c2] <= near_plane) behind2 = 1;
+                        avg2 += wd[c2];
+                    }
+                }
+                if (behind2) continue;
+                avg2 /= 4.0;
+                {
+                    TrackDriveQuadJob *jb = &s_track_drive_jobs[njobs];
+                    int qx2[4], qy2[4], c3;
+                    for (c3 = 0; c3 < 4; c3++) {
+                        qx2[c3] = (int)((wr[c3] / wd[c3]) * focal) + GPU_FB_WIDTH / 2;
+                        qy2[c3] = (int)((wh[c3] / wd[c3]) * focal) + GPU_FB_HEIGHT / 2;
+                    }
+                    jb->depth = avg2 - 2.5; /* just over the body shell */
+                    jb->x0 = qx2[0]; jb->y0 = qy2[0];
+                    jb->x1 = qx2[1]; jb->y1 = qy2[1];
+                    jb->x2 = qx2[2]; jb->y2 = qy2[2];
+                    jb->x3 = qx2[3]; jb->y3 = qy2[3];
+                    jb->page_rgba = NULL;
+                    jb->mod = 0xFFFFFFu;
+                    jb->color = fcol;
+                    jb->u0 = jb->v0 = jb->u1 = jb->v1 = 0.0f;
+                    jb->u2 = jb->v2 = jb->u3 = jb->v3 = 0.0f;
+                    njobs++;
+                }
+            }
+        }
         } /* pieces */
         }
         } /* cars */
@@ -1986,6 +2294,11 @@ static void draw_track_view(const TrackDemo *td) {
             draw_title_screen(s_title_frame++);
             return;
         }
+        /* ROUND 65: mode screen (up/down row, left/right mirror) */
+        if (s_psx_active && s_mode_active && s_vram_loaded) {
+            draw_mode_select(s_title_frame++, s_mode_sel, s_mode_mirror);
+            return;
+        }
         /* ROUND 62: car select (left/right, Enter races it) */
         if (s_psx_active && s_select_active && s_vram_loaded) {
             draw_car_select(s_title_frame++, s_select_model);
@@ -2021,6 +2334,15 @@ static size_t s_vag_len = 0;
  * proportional to the authentic drift slip, is the skid layer. */
 static int16_t *s_skid_pcm = NULL;
 static size_t s_skid_len = 0;
+/* ROUND 66: the impact one-shot. Programs 17-27 are the collision
+ * family; their lead tones are VAGs 18/21/22/23 at center 65 (two
+ * octaves under the engine's 89 -- a low thud) over the 19/20 scrub
+ * layer. VAG 18 is the light-contact lead: decoded once, fired as a
+ * one-shot on the physics wall branch, volume ~ speed. */
+static int16_t *s_impact_pcm = NULL;
+static size_t s_impact_len = 0;
+static volatile int s_impact_trig = 0;
+static volatile int s_impact_vol = 0;   /* 0..256 */
 static volatile int32_t s_audio_rpm = 0;
 static volatile int32_t s_audio_slip = 0;
 static volatile int s_audio_on = 0;
@@ -2042,9 +2364,14 @@ static void engine_audio_cb(void *userdata, Uint8 *stream, int len)
          * near idle at ~0.55x and near redline at ~1.9x -- the exact
          * center-89/shift-70 pitch law is a future refinement) */
         static double pos = 0.0, spos = 0.0;
+        static double ipos = -1.0; /* ROUND 66: impact cursor, <0 idle */
         double step = (0.55 + rpm / 10000.0 * 1.35) * 0.5;
         double skid_amp = slip > 40.0 ? (slip - 40.0) / 160.0 : 0.0;
         if (skid_amp > 0.9) skid_amp = 0.9;
+        if (s_impact_trig && s_impact_pcm != NULL) {
+            s_impact_trig = 0;
+            ipos = 0.0;
+        }
         for (i = 0; i < n; i++) {
             double v;
             size_t i0;
@@ -2058,6 +2385,14 @@ static void engine_audio_cb(void *userdata, Uint8 *stream, int len)
                 spos += 0.5;
                 if (spos >= (double)s_skid_len) spos -= (double)s_skid_len;
                 v += (double)s_skid_pcm[(size_t)spos] * skid_amp;
+            }
+            /* ROUND 66: impact one-shot (no loop -- plays out once) */
+            if (ipos >= 0.0 && s_impact_pcm != NULL) {
+                v += (double)s_impact_pcm[(size_t)ipos] *
+                     ((double)s_impact_vol / 256.0);
+                ipos += 0.35; /* center 65 vs the engine's 89 */
+                if (ipos >= (double)s_impact_len)
+                    ipos = -1.0;
             }
             if (v > 32000.0) v = 32000.0;
             if (v < -32000.0) v = -32000.0;
@@ -2136,6 +2471,23 @@ static void engine_vag_load(const char *vh_path, const char *vb_path,
                 s_vag_len = n;
                 printf("--vabfiles: engine VAG %d decoded (%zu samples) "
                        "for model %d\n", vag, n, model);
+            } else {
+                free(pcm);
+            }
+        }
+        /* ROUND 66: impact one-shot, VAG 18 (see s_impact_pcm) */
+        {
+            size_t cap = (size_t)h.vag_len[18] / 16 * 28 + 28;
+            int16_t *pcm = cap > 28 ? malloc(cap * sizeof(int16_t)) : NULL;
+            size_t n = pcm ? vab_decode_vag(&h, 18, vb, (size_t)vbn, pcm, cap) : 0;
+            if (n > 500) {
+                int16_t *old = s_impact_pcm;
+                s_impact_pcm = NULL;
+                s_impact_len = 0;
+                free(old);
+                s_impact_pcm = pcm;
+                s_impact_len = n;
+                printf("--vabfiles: impact VAG 18 decoded (%zu samples)\n", n);
             } else {
                 free(pcm);
             }
@@ -2266,6 +2618,62 @@ static void draw_animated_scene(Uint32 now_ms) {
  * else track->ready draws the real-track demo, else the original
  * phase 1-3 animated demo runs unchanged. Window title reflects
  * whichever mode is active. */
+/* ROUND 64: menu advance (Enter / pad A / pad Start) -- one shared
+ * path for keyboard and gamepad so the flows can't drift apart:
+ * title -> car select -> race (stats + body + engine VAG + chrono
+ * reset for the chosen model). */
+static void game_menu_advance(void)
+{
+    if (s_title_active) {
+        s_title_active = 0;
+        s_mode_active = 1; /* ROUND 65: mode screen first */
+    } else if (s_mode_active) {
+        /* ROUND 65: lock the chosen variant in -- the real pace/roster
+         * tables swap here (no-op fallback when no EXE was loaded). */
+        s_race_mode = k_mode_ids[s_mode_sel];
+        psx_ai_apply_mode(s_race_mode, s_mode_mirror);
+        s_mode_active = 0;
+        s_select_active = 1;
+    } else if (s_select_active) {
+        s_select_active = 0;
+        psx_car_set_model(&s_psx_car, s_select_model);
+        s_draw_cars[0].model = s_select_model;
+        if (s_vab_vh[0] != 0) {
+            int16_t *oldp = s_vag_pcm;
+            s_vag_pcm = NULL;
+            s_vag_len = 0;
+            free(oldp);
+            engine_vag_load(s_vab_vh, s_vab_vb, s_select_model);
+        }
+        s_lap_frames = 0;      /* ROUND 64: fresh chrono */
+        s_lap_time_count = 0;
+        /* ROUND 65: full race-state reset so a second race (new mode,
+         * new car) starts clean -- the AI field re-seeds from the
+         * freshly applied setup on its next step. */
+        s_ai_ready = 0;
+        s_hud_lap = 0;
+        s_race_over = 0;
+        s_race_pos = 12;
+    }
+}
+
+/* ROUND 64: open the first recognized game controller (startup scan
+ * and hot-plug share it). */
+static void pad_try_open(void)
+{
+    int i, n = SDL_NumJoysticks();
+    if (s_pad != NULL)
+        return;
+    for (i = 0; i < n; i++)
+        if (SDL_IsGameController(i)) {
+            s_pad = SDL_GameControllerOpen(i);
+            if (s_pad != NULL) {
+                printf("gamepad: %s\n", SDL_GameControllerName(s_pad));
+                return;
+            }
+        }
+}
+
 static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
     const char *title = (tex_page != NULL)
         ? "rr-pc-port (real texture demo -- decoded from a TEX*.TMS file)"
@@ -2273,10 +2681,11 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         ? "rr-pc-port (real track demo -- decoded from MAP.RRM/IDX.HED)"
         : "rr-pc-port (phase 3 -- software rasterizer)";
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         printf("SDL_Init failed (%s) -- continuing headless\n", SDL_GetError());
         return 1;
     }
+    pad_try_open(); /* ROUND 64: pick up an already-plugged controller */
 
     SDL_Window *window = SDL_CreateWindow(
         title,
@@ -2351,38 +2760,76 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = 0;
+            /* ROUND 64: gamepad hot-plug + menu buttons. Driving input
+             * is polled per physics step below (like the keyboard). */
+            if (ev.type == SDL_CONTROLLERDEVICEADDED)
+                pad_try_open();
+            if (ev.type == SDL_CONTROLLERDEVICEREMOVED && s_pad != NULL
+                && ev.cdevice.which == SDL_JoystickInstanceID(
+                       SDL_GameControllerGetJoystick(s_pad))) {
+                SDL_GameControllerClose(s_pad);
+                s_pad = NULL;
+                printf("gamepad: disconnected\n");
+            }
+            if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
+                switch (ev.cbutton.button) {
+                    case SDL_CONTROLLER_BUTTON_A:
+                    case SDL_CONTROLLER_BUTTON_START:
+                        if (s_title_active || s_mode_active || s_select_active)
+                            game_menu_advance();
+                        break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_UP:
+                        if (s_mode_active)
+                            s_mode_sel = (s_mode_sel + 3) % 4;
+                        break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+                        if (s_mode_active)
+                            s_mode_sel = (s_mode_sel + 1) % 4;
+                        break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: {
+                        int nmod = s_secret_unlocked ? 13 : 12;
+                        int step = ev.cbutton.button ==
+                                   SDL_CONTROLLER_BUTTON_DPAD_LEFT
+                                   ? nmod - 1 : 1;
+                        if (s_mode_active)
+                            s_mode_mirror = !s_mode_mirror;
+                        else if (s_select_active)
+                            s_select_model = (s_select_model + step) % nmod;
+                        break;
+                    }
+                    case SDL_CONTROLLER_BUTTON_Y:
+                        s_pad_manual = !s_pad_manual; /* auto <-> manual */
+                        break;
+                    default: break;
+                }
+            }
             if (ev.type == SDL_KEYDOWN) {
                 switch (ev.key.keysym.sym) {
                     case SDLK_ESCAPE: running = 0; break;
                     case SDLK_RETURN:
-                        if (s_title_active) {
-                            s_title_active = 0;
-                            s_select_active = 1;
-                        } else if (s_select_active) {
-                            s_select_active = 0;
-                            /* race with the chosen model (ROUND 62):
-                             * physics stats, drawn body AND the
-                             * model's own engine sample */
-                            psx_car_set_model(&s_psx_car, s_select_model);
-                            s_draw_cars[0].model = s_select_model;
-                            if (s_vab_vh[0] != 0) {
-                                int16_t *oldp = s_vag_pcm;
-                                s_vag_pcm = NULL;
-                                s_vag_len = 0;
-                                free(oldp);
-                                engine_vag_load(s_vab_vh, s_vab_vb,
-                                                s_select_model);
-                            }
-                        }
+                        game_menu_advance(); /* ROUND 64: shared w/ pad */
+                        break;
+                    case SDLK_UP:
+                        if (s_mode_active)
+                            s_mode_sel = (s_mode_sel + 3) % 4;
+                        break;
+                    case SDLK_DOWN:
+                        if (s_mode_active)
+                            s_mode_sel = (s_mode_sel + 1) % 4;
                         break;
                     case SDLK_LEFT:
-                        if (s_select_active)
-                            s_select_model = (s_select_model + 11) % 12;
+                    case SDLK_RIGHT: {
+                        /* ROUND 65: 13th car once the duel is won */
+                        int nmod = s_secret_unlocked ? 13 : 12;
+                        int step = ev.key.keysym.sym == SDLK_LEFT
+                                   ? nmod - 1 : 1;
+                        if (s_mode_active)
+                            s_mode_mirror = !s_mode_mirror;
+                        else if (s_select_active)
+                            s_select_model = (s_select_model + step) % nmod;
                         break;
-                    case SDLK_RIGHT:
-                        if (s_select_active)
-                            s_select_model = (s_select_model + 1) % 12;
-                        break;
+                    }
                     default: break;
                 }
                 if (track != NULL && track->ready) {
@@ -2524,22 +2971,65 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
             int shift_mod = (SDL_GetModState() & (KMOD_LSHIFT | KMOD_RSHIFT)) != 0;
             PsxInput pin;
             double step_dt = dt > 0.1 ? 0.1 : dt;
+            int pad_rb = 0, pad_lb = 0;
             memset(&pin, 0, sizeof pin);
             pin.throttle = keys[SDL_SCANCODE_UP] && !shift_mod;
             pin.brake = keys[SDL_SCANCODE_DOWN] && !shift_mod;
             pin.steer_left = keys[SDL_SCANCODE_LEFT] != 0;
             pin.steer_right = keys[SDL_SCANCODE_RIGHT] != 0;
-            s_psx_car.manual = shift_mod;
+            /* ROUND 64: gamepad merged with the keyboard -- triggers
+             * (or A) = throttle/brake, left stick (or dpad) = digital
+             * steer at the original's on/off threshold, shoulders =
+             * manual shifting (first use latches manual mode, pad Y
+             * toggles back -- see the event handler). */
+            if (s_pad != NULL) {
+                int rt = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+                int lt = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+                int lx = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_LEFTX);
+                pin.throttle |= rt > 8000 ||
+                    SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_A);
+                pin.brake |= lt > 8000 ||
+                    SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_B);
+                pin.steer_left |= lx < -10000 ||
+                    SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+                pin.steer_right |= lx > 10000 ||
+                    SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+                pad_rb = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+                pad_lb = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+                if (pad_rb || pad_lb)
+                    s_pad_manual = 1;
+            }
+            s_psx_car.manual = shift_mod || s_pad_manual;
             s_psx_accum += step_dt;
             while (s_psx_accum >= 1.0 / 30.0) {
                 static int up_was = 0, dn_was = 0;
+                static int rb_was = 0, lb_was = 0;
                 s_psx_accum -= 1.0 / 30.0;
-                pin.shift_up = shift_mod && keys[SDL_SCANCODE_UP] && !up_was;
-                pin.shift_down = shift_mod && keys[SDL_SCANCODE_DOWN] && !dn_was;
+                pin.shift_up = (shift_mod && keys[SDL_SCANCODE_UP] && !up_was)
+                             || (pad_rb && !rb_was);
+                pin.shift_down = (shift_mod && keys[SDL_SCANCODE_DOWN] && !dn_was)
+                               || (pad_lb && !lb_was);
                 up_was = shift_mod && keys[SDL_SCANCODE_UP];
                 dn_was = shift_mod && keys[SDL_SCANCODE_DOWN];
+                rb_was = pad_rb;
+                lb_was = pad_lb;
                 psx_car_frame(&s_psx_car, &pin, &s_psx_iface);
                 psx_bridge_resolve(&s_psx_bridge, &s_psx_car);
+                /* ROUND 66: collision SFX -- fired from the same wall
+                 * branch the original uses, volume ~ impact speed,
+                 * with a short cooldown so a grind isn't a machine gun. */
+                {
+                    static int imp_cd = 0;
+                    if (imp_cd > 0)
+                        imp_cd--;
+                    if (s_psx_car.wall_scrape && imp_cd == 0 &&
+                        s_psx_car.speed > 0x60) {
+                        int v2 = (int)((long)s_psx_car.speed * 256 / 0x2C0);
+                        s_impact_vol = v2 > 256 ? 256 : v2;
+                        s_impact_trig = 1;
+                        imp_cd = 18;
+                    }
+                }
                 s_audio_rpm = s_psx_car.rpm;   /* ROUND 57: engine tone */
                 s_audio_slip = s_psx_car.slip_last;
                 s_audio_on = 1;
@@ -2547,10 +3037,14 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                 {
                     static int lap_prev2 = 0;
                     int nsec2 = (int)s_psx_bridge.td.count;
-                    if (lap_prev2 > nsec2 - 8 && s_psx_bridge.cur < 8)
+                    if (lap_prev2 > nsec2 - 8 && s_psx_bridge.cur < 8) {
                         s_hud_lap++;
+                        chrono_lap_wrap(); /* ROUND 64 */
+                    }
                     lap_prev2 = s_psx_bridge.cur;
                 }
+                if (!s_race_over)
+                    s_lap_frames++; /* ROUND 64: 30Hz chrono tick */
                 /* ROUND 53: the AI opponents race too (visible ahead
                  * through the windshield -- the player car itself
                  * stays undrawn in this first-person mode). */
@@ -2909,10 +3403,14 @@ int main(int argc, char **argv) {
             {
                 static int lap_prev = 0;
                 int nsec = (int)s_psx_bridge.td.count;
-                if (lap_prev > nsec - 8 && s_psx_bridge.cur < 8)
+                if (lap_prev > nsec - 8 && s_psx_bridge.cur < 8) {
                     s_hud_lap++;
+                    chrono_lap_wrap(); /* ROUND 64 */
+                }
                 lap_prev = s_psx_bridge.cur;
             }
+            if (!s_race_over)
+                s_lap_frames++; /* ROUND 64: 30Hz chrono tick */
             {
                 /* ROUND 51: chase cam WITH a collision probe -- pull
                  * the camera in whenever its would-be position leaves
@@ -2974,12 +3472,15 @@ int main(int argc, char **argv) {
                 int px, py;
                 /* ROUND 61: the first 60 dumped frames of a selfdrive
                  * capture are the boot title screen (real logo). */
-                if (dumped < 60 && s_vram_loaded) {
+                if (dumped < 50 && s_vram_loaded) {
                     draw_title_screen(dumped);
+                } else if (dumped < 100 && s_vram_loaded) {
+                    /* ROUND 65: mode screen showcase (rows cycle) */
+                    draw_mode_select(dumped * 4, ((dumped - 50) / 12) % 4,
+                                     (dumped - 50) / 12 >= 4);
                 } else if (dumped < 150 && s_vram_loaded) {
-                    /* ROUND 62: car-select showcase, one model per
-                     * 30 frames, spinning */
-                    draw_car_select(dumped * 4, ((dumped - 60) / 30) % 12);
+                    /* ROUND 62: car-select showcase, spinning */
+                    draw_car_select(dumped * 4, ((dumped - 100) / 12) % 12);
                 } else {
                 draw_track_drive_scene(&track);
                 draw_race_hud(car.speed, (int)car.gear, s_hud_lap + 1, car.rpm);
