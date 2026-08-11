@@ -150,6 +150,7 @@ void psx_ai_init(PsxAiCar *c, int slot, const PsxBridge *b)
         c->progress = 1.5 + slot * 1.1;
         c->limit = 0;
         c->accel = 7 + (slot % 5) * 2;
+        c->lane = lane_pat[slot & 3] * (0.6 + 0.05 * (slot >> 2));
     }
     while (c->progress >= (double)n) c->progress -= (double)n;
     while (c->progress < 0.0) c->progress += (double)n;
@@ -158,7 +159,10 @@ void psx_ai_init(PsxAiCar *c, int slot, const PsxBridge *b)
     c->roll = 0;
     c->rubber = 0;
     c->wheel = (slot * 353) & 0xFFF;
-    c->lane = lane_pat[slot & 3] * (0.6 + 0.05 * (slot >> 2));
+    /* ROUND 61 BUG FIX: this used to unconditionally overwrite c->lane
+     * here, wiping out the ROUND-56 real grid lane computed above.
+     * The default lane pattern now only applies when no real lane was
+     * set (fallback paths set c->lane themselves). */
     c->x = c->y = c->z = 0.0;
     c->lap = 0;
 }

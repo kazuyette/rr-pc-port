@@ -542,6 +542,15 @@ static int16_t obj_cnt(uint32_t oi, int type)
  * mirrored into the draw list slots 1..PSX_AI_SLOTS. */
 static PsxAiCar s_ai_cars[PSX_AI_SLOTS];
 static int s_ai_ready = 0;
+static int s_hud_lap = 0; /* player lap (ROUND 61: hoisted here so the
+                             position calc below can see it) */
+static int s_race_pos = 12;    /* live position, 1..12 */
+static int s_race_over = 0;    /* set when the player finishes lap 3 */
+static int s_title_active = 1; /* ROUND 61: interactive boot state --
+                                  title screen until Enter (needs VRAM) */
+static int s_title_frame = 0;
+static int s_select_active = 0; /* ROUND 62: car-select state (after
+                                   title, before the race) */
 
 static void ai_step_and_fill(PsxBridge *br, double player_progress,
                              int obj_ready)
@@ -565,6 +574,29 @@ static void ai_step_and_fill(PsxBridge *br, double player_progress,
         cd->roll = ac->roll;
         cd->wheel = ac->wheel;
         cd->model = ac->model;
+    }
+    /* ROUND 61: live race position -- total progress (laps * course +
+     * section) player vs each active AI. The AI slots 5-10 start most
+     * of a lap ahead (rolling field), which is why you start P12. */
+    {
+        int nsec = (int)br->td.count;
+        double ptotal = (double)s_hud_lap * nsec + player_progress;
+        int ahead = 0;
+        for (di = 0; di < PSX_AI_SLOTS; di++) {
+            const PsxAiCar *ac2 = &s_ai_cars[di];
+            double atotal;
+            if (!ac2->active)
+                continue;
+            atotal = (double)ac2->lap * nsec + ac2->progress
+                     + psx_ai_setup_loaded * 0.0;
+            /* the strung-out slots grid ahead WITHOUT a lap credit --
+             * their start_rel already places them ahead in progress */
+            if (atotal > ptotal)
+                ahead++;
+        }
+        s_race_pos = 1 + ahead;
+        if (s_hud_lap >= 3)
+            s_race_over = 1;
     }
 }
 
@@ -757,6 +789,166 @@ static void draw_tachometer(int dst_x, int dst_y, int32_t rpm)
     }
 }
 
+/* ROUND 61: generic VRAM sprite blit (any tpage/clut/rect), used by
+ * the race-position ordinals, the finish overlay and the boot title
+ * screen. Transparent texels (alpha 0 in the baked page) skip. */
+static void hud_sprite_blit(int dst_x, int dst_y, uint16_t tpage,
+                            uint16_t clut, int u0, int v0, int u1,
+                            int v1, int scale)
+{
+    const uint32_t *pg = s_vram_loaded ? vram_page_get(tpage, clut) : NULL;
+    int u, v, sy, sx;
+    if (pg == NULL)
+        return;
+    for (v = v0; v <= v1; v++)
+        for (u = u0; u <= u1; u++) {
+            uint32_t t = pg[(v & 255) * 256 + (u & 255)];
+            uint32_t col;
+            if ((t & 0xFF000000u) == 0)
+                continue;
+            col = ((t & 0xFFu) << 16) | (t & 0xFF00u) | ((t >> 16) & 0xFFu);
+            for (sy = 0; sy < scale; sy++)
+                for (sx = 0; sx < scale; sx++) {
+                    int px = dst_x + (u - u0) * scale + sx;
+                    int py = dst_y + (v - v0) * scale + sy;
+                    if (px >= 0 && px < GPU_FB_WIDTH && py >= 0 && py < GPU_FB_HEIGHT)
+                        gpu_framebuffer[py * GPU_FB_WIDTH + px] = col;
+                }
+        }
+}
+
+/* Result/ordinal sprites on the HUD sheet (page 0 = tpage 5), rects
+ * measured round 61: cursive "winner" plus the italic 1st/2nd/3rd and
+ * the bare "th" ordinal for positions 4+. */
+#define SPR_WINNER 144, 24, 246, 57
+#define SPR_1ST 186, 55, 255, 90
+#define SPR_2ND 150, 88, 255, 120
+#define SPR_3RD 150, 118, 255, 150
+#define SPR_TH 160, 58, 186, 90
+
+/* ROUND 61: the boot TITLE SCREEN, in-engine -- the real "RIDGE
+ * RACER" logo (TEX3 page 36, 240x96 at VRAM (704,256) -> tpage 0x1B,
+ * its dedicated CLUT 0x7E8C, decoded rounds 38-39) over a night
+ * gradient, with a pulsing PRESS-START line. Shown at boot in the
+ * interactive build (Enter starts the race) and as the intro of
+ * selfdrive captures. */
+#define TITLE_TPAGE 0x1B
+#define TITLE_CLUT 0x7E8C
+
+static void draw_title_screen(int frame)
+{
+    int x, y;
+    for (y = 0; y < GPU_FB_HEIGHT; y++) {
+        int shade = 12 + y * 40 / GPU_FB_HEIGHT;
+        uint32_t c = ((uint32_t)(shade / 3) << 16) |
+                     ((uint32_t)(shade / 2) << 8) | (uint32_t)shade;
+        for (x = 0; x < GPU_FB_WIDTH; x++)
+            gpu_framebuffer[y * GPU_FB_WIDTH + x] = c;
+    }
+    hud_sprite_blit((GPU_FB_WIDTH - 240) / 2, 48, TITLE_TPAGE, TITLE_CLUT,
+                    0, 0, 239, 95, 1);
+    if ((frame / 20) & 1) {
+        /* the real START-BUTTON prompt strip (TEX3 page 37, 72x16 at
+         * VRAM (704,352) -> same tpage, v offset 96) */
+        hud_sprite_blit((GPU_FB_WIDTH - 96) / 2, 176, TITLE_TPAGE,
+                        TITLE_CLUT, 72, 96, 119, 111, 2);
+    }
+    (void)frame;
+}
+
+/* ROUND 62: the CAR SELECT screen -- the chosen model's real OBJ.RRO
+ * body (type-64 prims: verts + Q12 normals + texture tail) spinning
+ * on a dark stage, front axle included. Left/right cycles the 12
+ * consumer models, Enter races it. Painter-sorted quads, same z-
+ * mirror and 0.25 GTE scale conventions as the in-race car path. */
+static int s_select_model = 0;
+
+typedef struct { double depth; int x[4], y[4]; const uint32_t *pg;
+                 float u[4], v[4]; uint32_t mod; } SelQuad;
+
+static void draw_car_select(int frame, int model)
+{
+    static SelQuad q[512];
+    int nq = 0, x, y, k, pi;
+    double yaw = (double)(frame % 360) * 3.14159265358979 / 90.0;
+    double cy = cos(yaw), sy = sin(yaw);
+    if (s_obj_buf == NULL || !psx_ai_kit_loaded)
+        return;
+    for (y = 0; y < GPU_FB_HEIGHT; y++) {
+        int shade = 8 + (GPU_FB_HEIGHT - y) * 22 / GPU_FB_HEIGHT;
+        uint32_t c = ((uint32_t)(shade / 2) << 16) |
+                     ((uint32_t)(shade / 2) << 8) | (uint32_t)shade;
+        for (x = 0; x < GPU_FB_WIDTH; x++)
+            gpu_framebuffer[y * GPU_FB_WIDTH + x] = c;
+    }
+    for (pi = 0; pi < 3; pi++) {
+        const PsxCarKit *kt = &psx_ai_kit[model];
+        int obj = pi == 0 ? kt->body_obj : kt->axle_obj;
+        int dz = pi == 2 ? kt->axle_dz_model : 0;
+        int16_t n64;
+        uint32_t base, o;
+        if (obj < 0 || (uint32_t)obj >= s_obj_count)
+            continue;
+        base = s_obj_data_off[obj];
+        n64 = obj_cnt((uint32_t)obj, 3);
+        o = base + (uint32_t)obj_cnt(obj, 0) * 40u
+                 + (uint32_t)obj_cnt(obj, 1) * 48u
+                 + (uint32_t)obj_cnt(obj, 2) * 32u;
+        for (k = 0; k < n64 && nq < 512; k++) {
+            const uint8_t *rec = s_obj_buf + o + (uint32_t)k * 64u;
+            uint16_t tail[8];
+            int c2, t;
+            SelQuad *sq = &q[nq];
+            double avg = 0.0;
+            int16_t nx0 = (int16_t)(rec[24] | (rec[25] << 8));
+            int16_t ny0 = (int16_t)(rec[26] | (rec[27] << 8));
+            int16_t nz0 = (int16_t)-(int16_t)(rec[28] | (rec[29] << 8));
+            double wnx = (nz0 / 4096.0) * cy - (nx0 / 4096.0) * sy;
+            double d = wnx * -0.5 + (ny0 / 4096.0) * -0.8;
+            int sh = (int)(140.0 + 115.0 * (d > 0 ? d : 0));
+            if (sh > 255) sh = 255;
+            sq->mod = ((uint32_t)sh << 16) | ((uint32_t)sh << 8) | (uint32_t)sh;
+            for (t = 0; t < 8; t++)
+                tail[t] = (uint16_t)(rec[48 + t * 2] | (rec[49 + t * 2] << 8));
+            sq->pg = s_vram_loaded ? vram_page_get(tail[3], tail[1]) : NULL;
+            for (c2 = 0; c2 < 4; c2++) {
+                int vi = (c2 == 0) ? 0 : (c2 == 1) ? 1 : (c2 == 2) ? 3 : 2;
+                int uvi = (c2 == 3) ? 2 : (c2 == 2) ? 3 : c2;
+                int16_t mx = (int16_t)(rec[vi * 6] | (rec[vi * 6 + 1] << 8));
+                int16_t my = (int16_t)(rec[vi * 6 + 2] | (rec[vi * 6 + 3] << 8));
+                int16_t mz = (int16_t)(rec[vi * 6 + 4] | (rec[vi * 6 + 5] << 8));
+                double pmz = -(double)mz + dz, pmy = (double)my, pmx = (double)mx;
+                double rx = pmz * cy - pmx * sy;
+                double rz = pmz * sy + pmx * cy;
+                double depth = 1600.0 + rz;
+                sq->x[c2] = GPU_FB_WIDTH / 2 + (int)(rx * 340.0 / depth);
+                sq->y[c2] = 150 + (int)((pmy + 130.0) * 340.0 / depth);
+                sq->u[c2] = (float)(tail[uvi * 2] & 0xFF) / 255.0f;
+                sq->v[c2] = (float)(tail[uvi * 2] >> 8) / 255.0f;
+                avg += depth;
+            }
+            sq->depth = avg / 4.0;
+            nq++;
+        }
+    }
+    /* painter sort, far first */
+    for (k = 0; k < nq; k++) {
+        int m2 = k, j2;
+        SelQuad tmp;
+        for (j2 = k + 1; j2 < nq; j2++)
+            if (q[j2].depth > q[m2].depth) m2 = j2;
+        tmp = q[k]; q[k] = q[m2]; q[m2] = tmp;
+        if (q[k].pg != NULL)
+            gpu_draw_quad_textured_mod(q[k].x[0], q[k].y[0], q[k].u[0], q[k].v[0],
+                                       q[k].x[1], q[k].y[1], q[k].u[1], q[k].v[1],
+                                       q[k].x[2], q[k].y[2], q[k].u[2], q[k].v[2],
+                                       q[k].x[3], q[k].y[3], q[k].u[3], q[k].v[3],
+                                       q[k].pg, 256, 256, q[k].mod);
+    }
+    /* header: CAR + number */
+    hud_number(GPU_FB_WIDTH / 2 - 10, 16, model + 1, 4, 0x00FFD830);
+}
+
 static int hud_number_width(int value, int scale)
 {
     int w = 0, n = 0;
@@ -796,6 +988,33 @@ static void draw_race_hud(int32_t speed_raw, int gear, int lap, int32_t rpm)
     hud_number(12 + 18, 10, lap, 3, yellow);
     /* ROUND 57: the real tachometer, bottom-left like the original */
     draw_tachometer(8, GPU_FB_HEIGHT - 96, rpm);
+    /* ROUND 61: live race position, RR style -- big digit + ordinal
+     * sprite, above the gear readout. */
+    if (s_race_pos >= 1 && s_race_pos <= 12) {
+        int px = GPU_FB_WIDTH - 110;
+        int py = GPU_FB_HEIGHT - 100;
+        if (s_race_pos == 1)
+            hud_sprite_blit(px, py, HUD_TPAGE, HUD_CLUT, SPR_1ST, 1);
+        else if (s_race_pos == 2)
+            hud_sprite_blit(px, py, HUD_TPAGE, HUD_CLUT, SPR_2ND, 1);
+        else if (s_race_pos == 3)
+            hud_sprite_blit(px, py, HUD_TPAGE, HUD_CLUT, SPR_3RD, 1);
+        else
+            hud_number(px, py, s_race_pos, 3, yellow);
+    }
+    /* ROUND 61: finish overlay -- the real result sprites. */
+    if (s_race_over) {
+        if (s_race_pos == 1) {
+            hud_sprite_blit(60, 60, HUD_TPAGE, HUD_CLUT, SPR_WINNER, 2);
+            hud_sprite_blit(90, 140, HUD_TPAGE, HUD_CLUT, SPR_1ST, 2);
+        } else if (s_race_pos == 2) {
+            hud_sprite_blit(50, 90, HUD_TPAGE, HUD_CLUT, SPR_2ND, 2);
+        } else if (s_race_pos == 3) {
+            hud_sprite_blit(50, 90, HUD_TPAGE, HUD_CLUT, SPR_3RD, 2);
+        } else {
+            hud_number(110, 90, s_race_pos, 6, yellow);
+        }
+    }
 }
 
 static int s_selfdrive_frames = 0;
@@ -1760,9 +1979,18 @@ static void draw_track_drive_scene(const TrackDemo *td) {
 }
 
 /* Dispatches to whichever track-demo view mode is active. */
-static int s_hud_lap = 0; /* player lap, wrapped by the loops below */
 static void draw_track_view(const TrackDemo *td) {
     if (s_track_view_mode == TRACK_VIEW_DRIVE) {
+        /* ROUND 61: boot title (real logo) until Enter is pressed */
+        if (s_psx_active && s_title_active && s_vram_loaded) {
+            draw_title_screen(s_title_frame++);
+            return;
+        }
+        /* ROUND 62: car select (left/right, Enter races it) */
+        if (s_psx_active && s_select_active && s_vram_loaded) {
+            draw_car_select(s_title_frame++, s_select_model);
+            return;
+        }
         draw_track_drive_scene(td);
         if (s_psx_active)
             draw_race_hud(s_psx_car.speed, (int)s_psx_car.gear, s_hud_lap + 1,
@@ -1871,6 +2099,9 @@ static void engine_audio_start(void)
         SDL_PauseAudioDevice(s_audio_dev, 0);
 }
 
+static char s_vab_vh[512], s_vab_vb[512]; /* ROUND 62: kept for the
+    car-select reload (engine sample follows the chosen model) */
+
 static void engine_vag_load(const char *vh_path, const char *vb_path,
                             int model)
 {
@@ -1879,6 +2110,8 @@ static void engine_vag_load(const char *vh_path, const char *vb_path,
     long vhn, vbn;
     VabHeader h;
     int vag;
+    snprintf(s_vab_vh, sizeof s_vab_vh, "%s", vh_path);
+    snprintf(s_vab_vb, sizeof s_vab_vb, "%s", vb_path);
     f = fopen(vh_path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END); vhn = ftell(f); fseek(f, 0, SEEK_SET);
@@ -2121,6 +2354,35 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
             if (ev.type == SDL_KEYDOWN) {
                 switch (ev.key.keysym.sym) {
                     case SDLK_ESCAPE: running = 0; break;
+                    case SDLK_RETURN:
+                        if (s_title_active) {
+                            s_title_active = 0;
+                            s_select_active = 1;
+                        } else if (s_select_active) {
+                            s_select_active = 0;
+                            /* race with the chosen model (ROUND 62):
+                             * physics stats, drawn body AND the
+                             * model's own engine sample */
+                            psx_car_set_model(&s_psx_car, s_select_model);
+                            s_draw_cars[0].model = s_select_model;
+                            if (s_vab_vh[0] != 0) {
+                                int16_t *oldp = s_vag_pcm;
+                                s_vag_pcm = NULL;
+                                s_vag_len = 0;
+                                free(oldp);
+                                engine_vag_load(s_vab_vh, s_vab_vb,
+                                                s_select_model);
+                            }
+                        }
+                        break;
+                    case SDLK_LEFT:
+                        if (s_select_active)
+                            s_select_model = (s_select_model + 11) % 12;
+                        break;
+                    case SDLK_RIGHT:
+                        if (s_select_active)
+                            s_select_model = (s_select_model + 1) % 12;
+                        break;
                     default: break;
                 }
                 if (track != NULL && track->ready) {
@@ -2710,8 +2972,18 @@ int main(int argc, char **argv) {
                 char path[512];
                 FILE *pf;
                 int px, py;
+                /* ROUND 61: the first 60 dumped frames of a selfdrive
+                 * capture are the boot title screen (real logo). */
+                if (dumped < 60 && s_vram_loaded) {
+                    draw_title_screen(dumped);
+                } else if (dumped < 150 && s_vram_loaded) {
+                    /* ROUND 62: car-select showcase, one model per
+                     * 30 frames, spinning */
+                    draw_car_select(dumped * 4, ((dumped - 60) / 30) % 12);
+                } else {
                 draw_track_drive_scene(&track);
                 draw_race_hud(car.speed, (int)car.gear, s_hud_lap + 1, car.rpm);
+                }
                 snprintf(path, sizeof(path), "%s%04d.ppm", s_selfdrive_prefix, dumped);
                 pf = fopen(path, "wb");
                 if (pf) {
