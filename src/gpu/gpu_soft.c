@@ -161,6 +161,9 @@ void gpu_draw_quad_flat(int x0, int y0, int x1, int y1,
  * texture_rgba at each covered pixel. See gpu_draw_quad_textured's doc
  * comment in gpu_soft.h for the exact semantics (affine interpolation,
  * alpha==0 texels skipped, UV clamped to the texture's valid range). */
+/* per-draw modulation state for the textured path (round 52) */
+static uint32_t s_tex_mod = 0xFFFFFFu;
+
 static void gpu_draw_triangle_textured(int x0, int y0, float u0, float v0,
                                         int x1, int y1, float u1, float v1,
                                         int x2, int y2, float u2, float v2,
@@ -218,6 +221,15 @@ static void gpu_draw_triangle_textured(int x0, int y0, float u0, float v0,
                 if (ty > tex_h - 1) ty = tex_h - 1;
 
                 texel = texture_rgba[(size_t)ty * (size_t)tex_w + (size_t)tx];
+                if (s_tex_mod != 0xFFFFFFu && (texel >> 24) != 0) {
+                    uint32_t mr = (s_tex_mod >> 16) & 0xFF;
+                    uint32_t mg = (s_tex_mod >> 8) & 0xFF;
+                    uint32_t mb = s_tex_mod & 0xFF;
+                    uint32_t tr2 = ((texel & 0xFF) * mr) / 255u;
+                    uint32_t tg2 = (((texel >> 8) & 0xFF) * mg) / 255u;
+                    uint32_t tb2 = (((texel >> 16) & 0xFF) * mb) / 255u;
+                    texel = (texel & 0xFF000000u) | (tb2 << 16) | (tg2 << 8) | tr2;
+                }
                 if ((texel >> 24) != 0) { /* alpha != 0 */
                     int r = (int)(texel & 0xFF);
                     int g = (int)((texel >> 8) & 0xFF);
@@ -234,10 +246,25 @@ void gpu_draw_quad_textured(int x0, int y0, float u0, float v0,
                              int x2, int y2, float u2, float v2,
                              int x3, int y3, float u3, float v3,
                              const uint32_t *texture_rgba, int tex_w, int tex_h) {
+    s_tex_mod = 0xFFFFFFu;
     gpu_draw_triangle_textured(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
                                 texture_rgba, tex_w, tex_h);
     gpu_draw_triangle_textured(x0, y0, u0, v0, x2, y2, u2, v2, x3, y3, u3, v3,
                                 texture_rgba, tex_w, tex_h);
+}
+
+void gpu_draw_quad_textured_mod(int x0, int y0, float u0, float v0,
+                                int x1, int y1, float u1, float v1,
+                                int x2, int y2, float u2, float v2,
+                                int x3, int y3, float u3, float v3,
+                                const uint32_t *texture_rgba,
+                                int tex_w, int tex_h, uint32_t mod) {
+    s_tex_mod = mod;
+    gpu_draw_triangle_textured(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
+                                texture_rgba, tex_w, tex_h);
+    gpu_draw_triangle_textured(x0, y0, u0, v0, x2, y2, u2, v2, x3, y3, u3, v3,
+                                texture_rgba, tex_w, tex_h);
+    s_tex_mod = 0xFFFFFFu;
 }
 
 void gpu_draw_line(int x0, int y0, int x1, int y1, uint32_t color) {

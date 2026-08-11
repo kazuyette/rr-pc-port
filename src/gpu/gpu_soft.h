@@ -91,4 +91,15 @@ void gpu_draw_quad_textured(int x0, int y0, float u0, float v0,
                              int x3, int y3, float u3, float v3,
                              const uint32_t *texture_rgba, int tex_w, int tex_h);
 
+/* ROUND 52: textured quad with a per-quad color modulation (0xRRGGBB,
+ * each channel scales the texel /255 -- 0xFFFFFF = unmodified). Used
+ * for distance fog on track quads and normal-based lighting on car
+ * quads. */
+void gpu_draw_quad_textured_mod(int x0, int y0, float u0, float v0,
+                                int x1, int y1, float u1, float v1,
+                                int x2, int y2, float u2, float v2,
+                                int x3, int y3, float u3, float v3,
+                                const uint32_t *texture_rgba,
+                                int tex_w, int tex_h, uint32_t mod);
+
 #endif /* RR_PC_PORT_GPU_SOFT_H */
