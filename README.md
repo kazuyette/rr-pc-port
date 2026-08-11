@@ -23,7 +23,19 @@ portable C, the rest is byte-exact PS1 assembly transcription.
 - `src/main.c` -- minimal vertical slice: calls a few ported functions
   and prints their results, plus an optional SDL2 window/event loop that
   gracefully degrades to headless when SDL2 isn't available or there's
-  no display.
+  no display. Also hosts the `--track` course demo (top-down + drivable
+  3D views, autopilot, optional texturing) and, since Phase 7, a
+  real-physics driving mode (**C** key).
+- `src/physics.c`/`physics.h` -- portable-C car physics core (gearbox,
+  track-relative off-track test, heading interpolation) reimplementing
+  the CONFIRMED structure of the original PS1 game's live race code --
+  see ROADMAP.md Phase 7 and the file header comments for exactly what's
+  a faithful port vs. a documented approximation.
+- `tools/trackdata/` -- extracts Ridge Racer 1's two built-in course
+  section-geometry tables directly out of the user's own PSX.EXE, same
+  never-commit-the-asset pattern as the sibling `tools/mapparse` (MAP.RRM
+  / IDX.HED / OBJ.RRO) and `tools/texparse` (TEX*.TMS) tools -- see
+  ROADMAP.md for the full asset-format writeups.
 - `CMakeLists.txt` -- host gcc/clang build (not the PS1 cross toolchain).
 
 ## Building

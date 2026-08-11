@@ -13,14 +13,21 @@ add_executable(rr_pc_port
   src/globals.c
   src/stubs.c
   src/ported_logic.c
+  src/physics.c
+  src/physics_psx.c
+  src/psx_track_bridge.c
+  src/psx_ai.c
   src/psx_compat/psx_bios.c
   src/gpu/gpu_soft.c
   tools/texparse/tim.c
+  tools/texparse/psx_vram.c
+  tools/vabparse/vab.c
   tools/mapparse/map_rrm.c
   tools/mapparse/idx_hed.c
+  tools/trackdata/trackdata.c
 )
 
-target_include_directories(rr_pc_port PRIVATE src tools/texparse tools/mapparse)
+target_include_directories(rr_pc_port PRIVATE src tools/texparse tools/mapparse tools/trackdata tools/vabparse)
 target_compile_options(rr_pc_port PRIVATE -Wall -Wextra)
 
 # Phase 3: headless sanity check for the software rasterizer, no SDL
@@ -67,6 +74,58 @@ add_executable(objparse_tool
 target_include_directories(objparse_tool PRIVATE tools/mapparse)
 target_compile_options(objparse_tool PRIVATE -Wall -Wextra)
 
+# Physics-RE round 8 (rr-decomp session): extracts Ridge Racer 1's two
+# built-in section-chain course-geometry tables directly out of the
+# user's own PSX.EXE (never committed to this repo) -- see
+# tools/trackdata/trackdata.h for the format writeup (confirmed via an
+# exact instruction-level trace of PS1 func_80017B58, not guessed) and
+# src/physics.h for how this data feeds the port's physics code.
+add_executable(trackdata_tool
+  tools/trackdata/trackdata_main.c
+  tools/trackdata/trackdata.c
+)
+target_include_directories(trackdata_tool PRIVATE tools/trackdata)
+target_compile_options(trackdata_tool PRIVATE -Wall -Wextra)
+
+# Headless sanity check for src/physics.c + tools/trackdata's
+# project-point math: builds a synthetic track section by hand (no real
+# PSX.EXE needed) and asserts the CONFIRMED formulas (gear-shift
+# thresholds, asymmetric off-track width test, BAM12 heading wraparound)
+# behave as documented. See src/physics_test.c.
+add_executable(rr_pc_port_physics_test
+  src/physics_test.c
+  src/physics.c
+  tools/trackdata/trackdata.c
+)
+target_include_directories(rr_pc_port_physics_test PRIVATE src tools/trackdata)
+target_compile_options(rr_pc_port_physics_test PRIVATE -Wall -Wextra)
+add_test(NAME physics_sanity COMMAND rr_pc_port_physics_test)
+
+# Round 40: the AUTHENTIC fixed-point player physics (BAM12/integer,
+# ported from func_8001C490 + callees -- see src/physics_psx.c's
+# provenance ledger) with its own headless validation: autopilot lap
+# on a synthetic oval, drift-lag assertion, wall x0.7 assertion.
+add_executable(rr_pc_port_physics_psx_test
+  src/physics_psx_test.c
+  src/physics_psx.c
+)
+target_include_directories(rr_pc_port_physics_psx_test PRIVATE src)
+target_compile_options(rr_pc_port_physics_psx_test PRIVATE -Wall -Wextra)
+add_test(NAME physics_psx_authentic COMMAND rr_pc_port_physics_psx_test)
+
+# Round 42: the authentic core driving the REAL course (trackdata from
+# the user's local PSX.EXE -- SKIPs cleanly when RR_EXE_FILE is unset,
+# same pattern as texdemo_headless_decode; no game data in the repo).
+add_executable(rr_psx_drive
+  src/psx_drive_demo.c
+  src/physics_psx.c
+  src/psx_track_bridge.c
+  tools/trackdata/trackdata.c
+)
+target_include_directories(rr_psx_drive PRIVATE src tools/trackdata)
+target_compile_options(rr_psx_drive PRIVATE -Wall -Wextra)
+add_test(NAME psx_drive_real_course COMMAND rr_psx_drive)
+
 # Texture reverse-engineering tool: standalone CLI, no game/PSX
 # dependencies. Parses a TEX*.TMS file (from the user's own local disc
 # extraction, never committed to this repo) -- a container of PS1 TIM
@@ -101,6 +160,29 @@ target_include_directories(rr_pc_port_texdemo_test PRIVATE tools/texparse src/gp
 target_compile_options(rr_pc_port_texdemo_test PRIVATE -Wall -Wextra)
 add_test(NAME texdemo_headless_decode COMMAND rr_pc_port_texdemo_test)
 
+# Round 58: VAB sound-bank parser (RR.VH/RR.VB) -- standalone CLI, no
+# game data in the repo. Format writeup in tools/vabparse/vab.h
+# (confirmed byte-exact against the local files: 50 VAG sizes sum to
+# RR.VB's length). Can decode any VAG to a WAV for verification.
+add_executable(vabparse_tool
+  tools/vabparse/vabparse_main.c
+  tools/vabparse/vab.c
+)
+target_include_directories(vabparse_tool PRIVATE tools/vabparse)
+target_compile_options(vabparse_tool PRIVATE -Wall -Wextra)
+
+# Title-screen reconstruction: composites the real "RIDGE RACER" title
+# logo + START BUTTON prompt + namcot logo (decoded from the user's own
+# local TEX3.TMS, never committed to this repo) into a 320x240 PPM.
+# See tools/titlescreen/title_main.c for the asset-provenance writeup
+# (which pages of which bank, and what is reconstruction vs. traced).
+add_executable(rr_title_tool
+  tools/titlescreen/title_main.c
+  tools/texparse/tim.c
+)
+target_include_directories(rr_title_tool PRIVATE tools/texparse)
+target_compile_options(rr_title_tool PRIVATE -Wall -Wextra)
+
 # SDL2 is optional: this is a HOST port scaffold, not the PSX cross build.
 # If SDL2 dev headers/libs aren't present, we build a headless binary that
 # still exercises the ported logic functions -- see ROADMAP.md phase 3/4
@@ -130,4 +212,8 @@ endif()
 find_library(RR_PC_PORT_MATH_LIBRARY m)
 if(RR_PC_PORT_MATH_LIBRARY)
   target_link_libraries(rr_pc_port PRIVATE ${RR_PC_PORT_MATH_LIBRARY})
+  target_link_libraries(trackdata_tool PRIVATE ${RR_PC_PORT_MATH_LIBRARY})
+  target_link_libraries(rr_pc_port_physics_test PRIVATE ${RR_PC_PORT_MATH_LIBRARY})
+  target_link_libraries(rr_pc_port_physics_psx_test PRIVATE ${RR_PC_PORT_MATH_LIBRARY})
+  target_link_libraries(rr_psx_drive PRIVATE ${RR_PC_PORT_MATH_LIBRARY})
 endif()
