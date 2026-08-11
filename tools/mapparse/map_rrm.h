@@ -121,6 +121,28 @@ typedef struct {
 
 /* One 40-byte bulk-data record. See the big header comment above for
  * which fields are confirmed vs. guessed. */
+/* ROUND 45 UPDATE -- THE 16 "UNKNOWN" BYTES ARE DECODED (CONFIRMED):
+ * traced the PS1 track renderer func_800163E4 -> its quad emitter
+ * func_8003486C, which copies bytes 24-39 of each 40-byte entry
+ * VERBATIM into POLY_FT4 GPU packets:
+ *   bytes 24-25 (unk_18)  = u0,v0 texture coords (one byte each)
+ *   bytes 26-27 (heading) = CLUT id  (NOT a heading -- the round-44
+ *                            "slowly varying" observation was palette
+ *                            changes along track zones)
+ *   bytes 28-29 (unk_1c)  = u1,v1
+ *   bytes 30-31 (unk_1e)  = TPAGE id (the "small slowly-varying int")
+ *   bytes 32-33 (unk_20)  = u2,v2
+ *   bytes 34-35 (group_id)= ordering-table depth bias (the "stepped
+ *                            material id" -- it IS material-correlated,
+ *                            via sort layering: bridges above roads)
+ *   bytes 36-37 (unk_24)  = u3,v3
+ *   bytes 38-39 (flags)   = still open (candidate prim-type marker)
+ * Validated against the real MAP.RRM: every tpage decodes to a valid
+ * 4bpp VRAM page where the TEX banks load, every CLUT id to the
+ * y=480..509 palette rows, and the UV pairs form clean axis-aligned
+ * rects. See tools/texparse/psx_vram.{h,c} for the VRAM recreation
+ * that renders them. Field NAMES below are kept for source stability;
+ * read them via this mapping. */
 typedef struct {
     int16_t v0[3]; /* bytes 0-5:   corner/vector 0 */
     int16_t v1[3]; /* bytes 6-11:  corner/vector 1 (often shares v0[1], i.e. height, for type-B road-surface records) */

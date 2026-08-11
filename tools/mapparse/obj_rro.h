@@ -1,6 +1,55 @@
-/* obj_rro.h -- standalone (host-only, no PSX dependencies) PARTIAL
- * parser/documentation for Ridge Racer 1 (PS1, 1994, Namco)'s OBJ.RRO
- * scenery/object file.
+/* obj_rro.h -- standalone (host-only, no PSX dependencies) parser/
+ * documentation for Ridge Racer 1 (PS1, 1994, Namco)'s OBJ.RRO
+ * object-model file.
+ *
+ * ============ ROUND 50 CORRECTION -- THE FORMAT IS CLOSED ============
+ * Re-reading func_80012670's loop closely fixes a 4-byte field-offset
+ * error in this header's original decode, and with the corrected
+ * layout the file accounts for EVERY byte (445348/445348, zero slack
+ * -- the "100920 unaccounted bytes" below were an artifact of the
+ * wrong offsets, there is no mystery trailing section):
+ *
+ *   16-byte directory entry (post-load):
+ *     +0x0  int16  count of 40-byte prims   (x40)
+ *     +0x2  int16  count of 48-byte prims   (x48)
+ *     +0x4  int16  count of 32-byte prims   (x32)
+ *     +0x6  int16  count of 64-byte prims   (x64)
+ *     +0x8  int16  count of 72-byte prims   (x72)
+ *     +0xA  int16  count of 56-byte prims   (x56)
+ *     +0xC  ptr    absolute data pointer -- WRITTEN HERE by
+ *                  func_80012670 (`sw t4, 0x2($t1)` with t1=entry+0xA),
+ *                  not at +0x0 as originally documented.
+ *
+ *   This is EXACTLY the mesh-set table layout the prim emitters
+ *   (func_8003486C / func_80034EFC, round 45) consume: count at +0x0,
+ *   second count at +0x2, template pointer at +0xC. D_801D35E8 = this
+ *   directory's base; D_80173318 = the object count; the opponent-car
+ *   update func_8002128C renders car models through these emitters
+ *   with the slot's model id as the directory index (bounds-checked
+ *   against D_80173318) -- correcting round 27's "audio-only" reading
+ *   of that function.
+ *
+ *   PRIM TYPE LAYOUTS (round 50, confirmed empirically at 100% on the
+ *   real file):
+ *     40-byte = the SAME layout as MAP.RRM type-B records: 4 x int16[3]
+ *               corners + the 16-byte texture tail (u0v0, CLUT, u1v1,
+ *               TPAGE, u2v2, bias, u3v3, pad) -- 961/961 blocks decode
+ *               to valid tpage/clut/UVs.
+ *     64-byte = textured gouraud quad (POLY_GT4-family): 4 x int16[3]
+ *               MODEL-SPACE VERTS (bytes 0-23) + 4 x int16[3] UNIT
+ *               NORMALS in Q12 (bytes 24-47, |n| ~= 4096 -- per-vertex
+ *               lighting) + the same 16-byte texture tail (48-63).
+ *               This is the CAR BODY prim: objects 0..~23 are the car
+ *               models (~84-104 GT4 quads each), verified visually --
+ *               recognizable Ridge Racer car bodies with their real
+ *               liveries when rendered.
+ *     48/32/72/56-byte = not yet layout-decoded (48/72 plausibly the
+ *               tri/no-normal/flat variants of the same family).
+ * =====================================================================
+ *
+ * (Original round's header follows -- its directory field offsets are
+ * SUPERSEDED by the correction above; kept for the confirmed load-
+ * sequence provenance.)
  *
  * Found by reading PS1 function func_80012670 (rr-decomp asm/29E8.s,
  * ~address 0x80012670) instruction-by-instruction, the same technique
@@ -180,4 +229,23 @@ typedef enum {
 int obj_rro_parse(const uint8_t *buf, size_t buf_size, ObjRroFile *out);
 void obj_rro_free(ObjRroFile *f);
 
-#endif /* RR_OBJ_RRO_H */
+/* ROUND 58 -- the remaining prim layouts, decoded from real records:
+ *   type 0 (40B): 4 verts + the standard 16-byte texture tail --
+ *                 IDENTICAL to MAP.RRM type-B (POLY_FT4). 144 objects
+ *                 (scenery 67+).
+ *   type 1 (48B): 4 verts + texture tail + 8 bytes: base RGB color +
+ *                 code -- a TINTED textured quad. 40 objects.
+ *   type 2 (32B): 4 verts + 8 bytes color/pad -- FLAT UNTEXTURED quad
+ *                 (POLY_F4). 15 objects (car glass/underbody).
+ *   type 3 (64B): 4 verts + 4 unit normals + texture tail (round 50).
+ *   type 4 (72B): 4 verts + 4 PER-VERTEX unit normals + texture tail
+ *                 + RGB -- the GOURAUD textured quad (7 big scenery
+ *                 objects: 60, 64, 66, 101, 177, 178, 193).
+ *   type 5 (56B): 4 verts + 4 per-vertex normals + 8 bytes short
+ *                 tail -- smooth-shaded quad, minimal texturing
+ *                 (19 objects, 139+: lamps/signs family).
+ */
+
+
+
+#endif /* header guard */

@@ -59,9 +59,18 @@ int idx_hed_section_world_origin(const IdxHedFile *f, int section,
     if (status != IDX_HED_OK) {
         return status;
     }
-    /* HYPOTHESIS (empirically best of 6 tried combinations this round):
-     * mirror the column axis, do not swap axes, no rotation. */
-    mirrored_col = (IDX_HED_GRID_DIM - 1) - col;
+    /* ROUND 59 -- CONFIRMED against the game's own streamer
+     * (func_80012C14: cell id = IDX[row*32 + (30 - world_col)]) and
+     * validated on the 12 real grid anchors (all contained) plus
+     * 232/256 course-section centers (the 24 misses are the dirt
+     * canyon, sections 34-65, whose road is not made of B quads):
+     * the MESH-frame cell origin is (30 - file_col, file_row) * 2048.
+     * NOTE the returned origin is in the game's MESH frame; the
+     * physics/trackdata frame is x_phys = 61440 - x_mesh (D_801733A0
+     * = 0xF000), so consumers working in the physics frame must
+     * convert whole vert positions: x = 61440 - (origin_x + vert_x).
+     * The old (31-col)+vert hypothesis is retired. */
+    mirrored_col = 30 - col;
     if (world_x) *world_x = (int32_t)mirrored_col * IDX_HED_CELL_SIZE_WORLD_UNITS;
     if (world_z) *world_z = (int32_t)row * IDX_HED_CELL_SIZE_WORLD_UNITS;
     return IDX_HED_OK;
