@@ -92,8 +92,14 @@
 #include "ported_logic.h"
 #include "gpu/gpu_soft.h"
 #include "tim.h"
+#include "psx_vram.h"
 #include "map_rrm.h"
 #include "idx_hed.h"
+#include "physics.h"
+#include "physics_psx.h"
+#include "psx_track_bridge.h"
+#include "psx_ai.h"
+#include "vab.h"
 
 #ifdef HAVE_SDL2
 #include <SDL2/SDL.h>
@@ -388,10 +394,497 @@ static double s_cam_x = 0.0, s_cam_z = 0.0, s_cam_height = 300.0, s_cam_yaw = 0.
 #define TRACK_DRIVE_HEIGHT_MIN  20.0
 #define TRACK_DRIVE_HEIGHT_MAX  4000.0
 
+/* "Real physics" driving mode (C toggles): drives s_cam_x/s_cam_z/
+ * s_cam_yaw from src/physics.c's gearbox + integration model instead of
+ * the fixed-step free-cam movement above. Uses this file's own (sin,
+ * cos) forward convention, which src/physics.c's header comment
+ * documents as chosen to match -- confirmed identical here, so no
+ * conversion is needed when syncing the two. See src/physics.h for what
+ * in this model is a confirmed port of the original PS1 game's formulas
+ * (gear-shift thresholds, track off-track test) vs. an original
+ * approximation (accel/steering feel) -- this integration doesn't yet
+ * load the real course geometry (tools/trackdata), so off-track
+ * detection isn't wired up here, only the gearbox + movement model. */
+static int s_physics_mode = 0;
+static PhysicsCar s_physics_car;
+static double s_physics_hud_timer = 0.0;
+
+/* Optional real course geometry (tools/trackdata), loaded from the
+ * user's own PSX.EXE via --physicsdata -- see main()'s arg parsing and
+ * ROADMAP.md Phase 7. Purely additive: physics mode works fine without
+ * it (movement only, no off-track feedback), same graceful-fallback
+ * convention this file already uses for --track/--track TEX. */
+static TrackData s_physics_trackdata;
+static int s_physics_trackdata_loaded = 0;
+/* ROUND 43: the AUTHENTIC fixed-point core (physics_psx.c, rounds
+ * 40-42) drives the interactive mode whenever the real course geometry
+ * is loaded (--physicsdata) -- the float model above stays as the
+ * fallback without it. s_psx_accum implements a fixed 30Hz step (the
+ * original's frame rate) decoupled from the render rate. */
+/* ROUND 45: real PS1 VRAM recreation + per-(tpage,clut) baked page
+ * cache -- see tools/texparse/psx_vram.h for the MAP.RRM texture-field
+ * breakthrough this feeds on. Loaded via --texdir <dir with TEX*.TMS>. */
+static PsxVram s_vram;
+static int s_vram_loaded = 0;
+typedef struct { uint16_t tpage, clut; uint32_t *rgba; } VramPageCacheEnt;
+static VramPageCacheEnt s_vram_cache[192];
+static int s_vram_cache_n = 0;
+
+static const uint32_t *vram_page_get(uint16_t tpage, uint16_t clut)
+{
+    int i;
+    for (i = 0; i < s_vram_cache_n; i++)
+        if (s_vram_cache[i].tpage == tpage && s_vram_cache[i].clut == clut)
+            return s_vram_cache[i].rgba;
+    if (s_vram_cache_n >= (int)(sizeof(s_vram_cache) / sizeof(s_vram_cache[0])))
+        return NULL;
+    {
+        uint32_t *pg = (uint32_t *)malloc(256 * 256 * sizeof(uint32_t));
+        if (pg == NULL) return NULL;
+        psx_vram_bake_page(&s_vram, tpage, clut, pg);
+        s_vram_cache[s_vram_cache_n].tpage = tpage;
+        s_vram_cache[s_vram_cache_n].clut = clut;
+        s_vram_cache[s_vram_cache_n].rgba = pg;
+        s_vram_cache_n++;
+        return pg;
+    }
+}
+
+/* ROUND 51: OBJ.RRO car models in the port. Corrected directory
+ * layout (round 50): 6 int16 prim counts at +0x0..+0xA (sizes
+ * 40/48/32/64/72/56) + data pointer slot at +0xC (computed at load
+ * here, like func_80012670 does in-place). Type-64 prims = car body:
+ * 4 model verts + 4 Q12 normals + the standard 16-byte texture tail. */
+static uint8_t *s_obj_buf = NULL;
+static long s_obj_size = 0;
+static uint32_t s_obj_count = 0;
+static uint32_t *s_obj_data_off = NULL; /* [count] absolute offsets */
+static double s_car_model_scale = 1.0;
+/* camera ground sample, hoisted to file scope (round 52 -- the drone
+ * spawner in the selfdrive loop needs it too) */
+static double s_ground_y = 0.0;
+static int s_ground_seeded = 0;
+
+/* ROUND 52: N-car draw list (player + opponents).
+ * ROUND 53: opponents are now the real AI (psx_ai.c, ported from
+ * func_80025268 + callees); `model` is a MODEL ID (0..12) resolved
+ * through the D_80059228 piece-kit table when it's loaded, and the
+ * cars carry the authentic corner-lean angle (+0x28). */
+typedef struct {
+    int on;
+    double x, y, z;
+    int32_t heading, wheel, roll;
+    int model;
+    int y_seeded; /* per-car ground continuity (see ground_sample_at) */
+} CarDraw;
+#define MAX_DRAW_CARS 13
+static CarDraw s_draw_cars[MAX_DRAW_CARS];
+/* legacy aliases used by the older single-car code paths */
+#define s_car_draw_on (s_draw_cars[0].on)
+#define s_car_draw_x (s_draw_cars[0].x)
+#define s_car_draw_y (s_draw_cars[0].y)
+#define s_car_draw_z (s_draw_cars[0].z)
+#define s_car_draw_heading (s_draw_cars[0].heading)
+#define s_car_draw_wheel (s_draw_cars[0].wheel)
+#define s_car_draw_model (s_draw_cars[0].model)
+
+static int obj_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint32_t i, off, cur;
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); s_obj_size = ftell(f); fseek(f, 0, SEEK_SET);
+    s_obj_buf = (uint8_t *)malloc((size_t)s_obj_size);
+    if (!s_obj_buf || fread(s_obj_buf, 1, (size_t)s_obj_size, f) != (size_t)s_obj_size) {
+        fclose(f); free(s_obj_buf); s_obj_buf = NULL; return 0;
+    }
+    fclose(f);
+    s_obj_count = (uint32_t)s_obj_buf[0] | ((uint32_t)s_obj_buf[1] << 8) |
+                  ((uint32_t)s_obj_buf[2] << 16) | ((uint32_t)s_obj_buf[3] << 24);
+    s_obj_data_off = (uint32_t *)malloc(s_obj_count * sizeof(uint32_t));
+    if (!s_obj_data_off) return 0;
+    off = 4; cur = 4 + s_obj_count * 16;
+    for (i = 0; i < s_obj_count; i++) {
+        static const int psz[6] = { 40, 48, 32, 64, 72, 56 };
+        int k; long sz = 0;
+        s_obj_data_off[i] = cur;
+        for (k = 0; k < 6; k++) {
+            int16_t c = (int16_t)(s_obj_buf[off + k * 2] |
+                                  (s_obj_buf[off + k * 2 + 1] << 8));
+            sz += (long)c * psz[k];
+        }
+        cur += (uint32_t)sz;
+        off += 16;
+    }
+    /* ROUND 53 -- model scale CONFIRMED by tracing func_800129AC: the
+     * GTE translation is the camera-relative world position SHIFTED
+     * LEFT BY 2 (out+0x2C/0x30/0x34 = pos<<2) while model vertices
+     * pass through 1:1, so one model unit = 1/4 world-position unit.
+     * Cross-check: the kit table stores the rear-axle offset both
+     * ways -- -83 world units (+0x8) vs -335 model units (+0xA),
+     * ratio 4.04. Our empirical 0.30 (round 51) was this 0.25 seen
+     * through a slightly-off bbox guess. */
+    s_car_model_scale = 0.25;
+    printf("--objfile: %u objects, %ld bytes (closes at %u)\n",
+           s_obj_count, s_obj_size, cur);
+    return cur == (uint32_t)s_obj_size;
+}
+
+static int16_t obj_cnt(uint32_t oi, int type)
+{
+    uint32_t off = 4 + oi * 16;
+    return (int16_t)(s_obj_buf[off + type * 2] |
+                     (s_obj_buf[off + type * 2 + 1] << 8));
+}
+
+/* ROUND 53: the real opponents. Stepped once per 30Hz physics frame
+ * from BOTH the interactive loop and the selfdrive capture, then
+ * mirrored into the draw list slots 1..PSX_AI_SLOTS. */
+static PsxAiCar s_ai_cars[PSX_AI_SLOTS];
+static int s_ai_ready = 0;
+
+static void ai_step_and_fill(PsxBridge *br, double player_progress,
+                             int obj_ready)
+{
+    int di;
+    if (!s_ai_ready) {
+        for (di = 0; di < PSX_AI_SLOTS; di++)
+            psx_ai_init(&s_ai_cars[di], di, br);
+        s_ai_ready = 1;
+    }
+    for (di = 0; di < PSX_AI_SLOTS && 1 + di < MAX_DRAW_CARS; di++) {
+        PsxAiCar *ac = &s_ai_cars[di];
+        CarDraw *cd = &s_draw_cars[1 + di];
+        psx_ai_frame(ac, br, player_progress);
+        cd->on = obj_ready;
+        cd->x = ac->x;
+        cd->z = ac->z;
+        cd->y = s_ground_y; /* camera-deck sample; wrong on far slopes
+                               (known limitation, see ROADMAP) */
+        cd->heading = ac->heading;
+        cd->roll = ac->roll;
+        cd->wheel = ac->wheel;
+        cd->model = ac->model;
+    }
+}
+
+
+/* ROUND 54: race HUD -- speed / gear / lap, PS1-arcade style (big
+ * yellow digits with a hard drop shadow, top-right km/h readout like
+ * the original layout). Typography is a built-in 4x6 microfont for
+ * now (PLACEHOLDER -- the real TEX0 HUD sprite sheet is a future
+ * round); the VALUES are the authentic ones: km/h = speed * 33/100
+ * (0x2C3 top speed ~ 232 km/h, matching the original's readout),
+ * gear from the authentic gearbox, lap from the section wrap. */
+static const uint8_t k_hudfont[16][6] = {
+    { 0xF, 0x9, 0x9, 0x9, 0x9, 0xF }, /* 0 */
+    { 0x2, 0x6, 0x2, 0x2, 0x2, 0x7 }, /* 1 */
+    { 0xF, 0x1, 0xF, 0x8, 0x8, 0xF }, /* 2 */
+    { 0xF, 0x1, 0x7, 0x1, 0x1, 0xF }, /* 3 */
+    { 0x9, 0x9, 0xF, 0x1, 0x1, 0x1 }, /* 4 */
+    { 0xF, 0x8, 0xF, 0x1, 0x1, 0xF }, /* 5 */
+    { 0xF, 0x8, 0xF, 0x9, 0x9, 0xF }, /* 6 */
+    { 0xF, 0x1, 0x2, 0x2, 0x4, 0x4 }, /* 7 */
+    { 0xF, 0x9, 0xF, 0x9, 0x9, 0xF }, /* 8 */
+    { 0xF, 0x9, 0xF, 0x1, 0x1, 0xF }, /* 9 */
+    { 0x9, 0xA, 0xC, 0xC, 0xA, 0x9 }, /* K */
+    { 0x9, 0xF, 0xF, 0x9, 0x9, 0x9 }, /* M */
+    { 0x9, 0x9, 0xF, 0x9, 0x9, 0x9 }, /* H */
+    { 0xF, 0x8, 0x8, 0x8, 0x8, 0xF }, /* C (unused) */
+    { 0x8, 0x8, 0x8, 0x8, 0x8, 0xF }, /* L */
+    { 0x0, 0x0, 0x0, 0x6, 0x6, 0x0 }, /* . */
+};
+
+static void hud_glyph(int gx, int gy, int glyph, int scale, uint32_t col)
+{
+    int r, c, sy, sx;
+    for (r = 0; r < 6; r++)
+        for (c = 0; c < 4; c++) {
+            if (!(k_hudfont[glyph][r] & (8 >> c)))
+                continue;
+            for (sy = 0; sy < scale; sy++)
+                for (sx = 0; sx < scale; sx++) {
+                    int px = gx + c * scale + sx, py = gy + r * scale + sy;
+                    if (px >= 0 && px < GPU_FB_WIDTH && py >= 0 && py < GPU_FB_HEIGHT)
+                        gpu_framebuffer[py * GPU_FB_WIDTH + px] = col;
+                }
+        }
+}
+
+/* ROUND 55: REAL glyphs -- TEX0 page 0 is the game's HUD sprite
+ * sheet ("winner", "1st/2nd/3rd", "TIME IS UP", the tachometer, and
+ * several digit fonts). It loads at VRAM x=320 (halfwords), so the
+ * 4bpp indices are read straight out of the recreated VRAM; the
+ * medium digit row lives at y=152..175 with the per-digit x-runs
+ * measured below. The glyph SHAPES are the authentic sprites; only
+ * the tint is ours until the HUD CLUT id is traced. */
+static int hud_tex_texel(int u, int v)
+{
+    uint16_t hw;
+    if (!s_vram_loaded || u < 0 || u > 255 || v < 0 || v > 255)
+        return 0;
+    hw = s_vram.hw[v * PSX_VRAM_W + 320 + (u >> 2)];
+    return (hw >> ((u & 3) * 4)) & 0xF;
+}
+
+static const struct { int x0, x1; } k_hud_digit[10] = {
+    { 4, 20 }, { 30, 39 }, { 51, 68 }, { 75, 92 }, { 100, 117 },
+    { 125, 142 }, { 149, 166 }, { 173, 190 }, { 197, 213 }, { 221, 237 }
+};
+#define HUD_DIGIT_Y0 152
+#define HUD_DIGIT_Y1 175
+
+/* ROUND 56: the HUD digit CLUT is 0x7EC8 -- found by scoring every
+ * CLUT row TEX0 declares against the digit-row texels: it decodes
+ * them to the authentic chrome-silver gradient of the original speed
+ * readout (runner-up 0x7F82 is a flatter grey; 0x7802 a yellow/red
+ * variant, likely the highlight state). Page 0 sits at VRAM x=320 ->
+ * tpage id 5. Full-color path below; the mask+tint fallback stays
+ * for when the page cache can't bake. */
+#define HUD_TPAGE 5
+#define HUD_CLUT 0x7EC8
+/* ROUND 60: the yellow/red CLUT variant 0x7802 (found in the round-56
+ * scoring) is the REDLINE highlight -- applied to the km/h digits
+ * when the authentic rpm sits in the dial's red zone (>= 9000). */
+#define HUD_CLUT_HOT 0x7802
+static uint16_t s_hud_digit_clut = HUD_CLUT;
+
+/* Draws one authentic digit glyph, integer-scaled; returns advance. */
+static int hud_sprite_digit(int dst_x, int dst_y, int digit, int scale,
+                            uint32_t col)
+{
+    int u, v, sy, sx;
+    int w = k_hud_digit[digit].x1 - k_hud_digit[digit].x0 + 1;
+    const uint32_t *pg = s_vram_loaded
+        ? vram_page_get(HUD_TPAGE, s_hud_digit_clut) : NULL;
+    for (v = HUD_DIGIT_Y0; v <= HUD_DIGIT_Y1; v++)
+        for (u = k_hud_digit[digit].x0; u <= k_hud_digit[digit].x1; u++) {
+            uint32_t texcol = col;
+            if (!hud_tex_texel(u, v))
+                continue;
+            if (pg != NULL) {
+                uint32_t t = pg[v * 256 + u];
+                if ((t & 0xFF000000u) == 0)
+                    continue;
+                /* page cache is ABGR (R low byte) -- swap to the
+                 * framebuffer's RGB layout */
+                texcol = ((t & 0xFFu) << 16) | (t & 0xFF00u) |
+                         ((t >> 16) & 0xFFu);
+            }
+            for (sy = 0; sy < scale; sy++)
+                for (sx = 0; sx < scale; sx++) {
+                    int px = dst_x + (u - k_hud_digit[digit].x0) * scale + sx;
+                    int py = dst_y + (v - HUD_DIGIT_Y0) * scale + sy;
+                    if (px >= 0 && px < GPU_FB_WIDTH && py >= 0 && py < GPU_FB_HEIGHT)
+                        gpu_framebuffer[py * GPU_FB_WIDTH + px] = texcol;
+                }
+        }
+    return (w + 3) * scale;
+}
+
+static void hud_number(int x, int y, int value, int scale, uint32_t col)
+{
+    char buf[12];
+    int i, n = 0;
+    if (value < 0) value = 0;
+    do { buf[n++] = (char)(value % 10); value /= 10; } while (value && n < 11);
+    if (s_vram_loaded) {
+        /* authentic TEX0 sprite digits (scale halved: they are 24px
+         * tall natively where the microfont was 6) */
+        int sc = scale >= 2 ? scale / 2 : 1;
+        int gx = x;
+        for (i = n - 1; i >= 0; i--)
+            gx += hud_sprite_digit(gx, y, buf[i], sc, col);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        int gx = x + (n - 1 - i) * (5 * scale);
+        hud_glyph(gx + scale, y + scale, buf[i], scale, 0xFF000000u); /* shadow */
+        hud_glyph(gx, y, buf[i], scale, col);
+    }
+}
+
+/* ROUND 57: the tachometer -- the dial face (ticks, digits, red
+ * zone, "X1000 R/MIN") lives on the same TEX0 HUD page at
+ * (60,64)-(152,151); it decodes cleanly with the page's own declared
+ * CLUT 0x7984. The needle is drawn programmatically from the hub at
+ * ~(105,107): the printed scale runs 0 at the bottom (270 deg,
+ * screen) counter-clockwise to 10 at the right (0 deg), so
+ * angle = 270 - rpm/0x2710 * 270. */
+#define HUD_DIAL_X0 64
+#define HUD_DIAL_Y0 73
+#define HUD_DIAL_X1 152
+#define HUD_DIAL_Y1 151
+#define HUD_DIAL_CLUT 0x7984
+
+static void draw_tachometer(int dst_x, int dst_y, int32_t rpm)
+{
+    const uint32_t *pg = s_vram_loaded ? vram_page_get(HUD_TPAGE, HUD_DIAL_CLUT)
+                                       : NULL;
+    int u, v;
+    double cx, cy, ang, ca, sa2;
+    int i;
+    if (pg == NULL)
+        return;
+    for (v = HUD_DIAL_Y0; v <= HUD_DIAL_Y1; v++)
+        for (u = HUD_DIAL_X0; u <= HUD_DIAL_X1; u++) {
+            uint32_t t = pg[v * 256 + u];
+            int px = dst_x + (u - HUD_DIAL_X0);
+            int py = dst_y + (v - HUD_DIAL_Y0);
+            if ((t & 0xFF000000u) == 0)
+                continue;
+            if (px >= 0 && px < GPU_FB_WIDTH && py >= 0 && py < GPU_FB_HEIGHT)
+                gpu_framebuffer[py * GPU_FB_WIDTH + px] =
+                    ((t & 0xFFu) << 16) | (t & 0xFF00u) | ((t >> 16) & 0xFFu);
+        }
+    /* needle */
+    if (rpm < 0) rpm = 0;
+    if (rpm > 0x2710) rpm = 0x2710;
+    cx = dst_x + (105 - HUD_DIAL_X0);
+    cy = dst_y + (107 - HUD_DIAL_Y0);
+    ang = (270.0 - (double)rpm / 10000.0 * 270.0) * 3.14159265358979 / 180.0;
+    ca = cos(ang);
+    sa2 = -sin(ang); /* screen y-down */
+    for (i = 4; i < 40; i++) {
+        int px = (int)(cx + ca * i);
+        int py = (int)(cy + sa2 * i);
+        int t2;
+        for (t2 = 0; t2 < 2; t2++) {
+            int qx = px, qy = py + t2;
+            if (qx >= 0 && qx < GPU_FB_WIDTH && qy >= 0 && qy < GPU_FB_HEIGHT)
+                gpu_framebuffer[qy * GPU_FB_WIDTH + qx] = 0x00FF6020;
+        }
+    }
+}
+
+static int hud_number_width(int value, int scale)
+{
+    int w = 0, n = 0;
+    char buf[12];
+    if (value < 0) value = 0;
+    do { buf[n++] = (char)(value % 10); value /= 10; } while (value && n < 11);
+    if (s_vram_loaded) {
+        int sc = scale >= 2 ? scale / 2 : 1, i;
+        for (i = 0; i < n; i++)
+            w += (k_hud_digit[(int)buf[i]].x1 -
+                  k_hud_digit[(int)buf[i]].x0 + 4) * sc;
+        return w;
+    }
+    return n * 5 * scale;
+}
+
+static void draw_race_hud(int32_t speed_raw, int gear, int lap, int32_t rpm)
+{
+    /* speed, top-right, big yellow -- kmh = speed*33/100 (authentic
+     * ~232 km/h ceiling); digits are the real TEX0 HUD sprites when
+     * the texture banks are loaded (see hud_sprite_digit). */
+    int kmh = (int)((long)speed_raw * 33 / 100);
+    uint32_t yellow = 0x00FFD830, white = 0x00F0F0F0;
+    int sx = GPU_FB_WIDTH - 12 - hud_number_width(kmh, 4);
+    s_hud_digit_clut = rpm >= 9000 ? HUD_CLUT_HOT : HUD_CLUT;
+    hud_number(sx, 10, kmh, 4, yellow);
+    s_hud_digit_clut = HUD_CLUT;
+    /* "KMH" tag under it */
+    hud_glyph(GPU_FB_WIDTH - 14 - 3 * 10, 62, 10, 2, white);
+    hud_glyph(GPU_FB_WIDTH - 14 - 2 * 10, 62, 11, 2, white);
+    hud_glyph(GPU_FB_WIDTH - 14 - 1 * 10, 62, 12, 2, white);
+    /* gear, bottom-right, white */
+    hud_number(GPU_FB_WIDTH - 14 - hud_number_width(gear, 4),
+               GPU_FB_HEIGHT - 40, gear, 4, white);
+    /* lap counter "L n", top-left */
+    hud_glyph(12, 12, 14, 3, white);
+    hud_number(12 + 18, 10, lap, 3, yellow);
+    /* ROUND 57: the real tachometer, bottom-left like the original */
+    draw_tachometer(8, GPU_FB_HEIGHT - 96, rpm);
+}
+
+static int s_selfdrive_frames = 0;
+static const char *s_selfdrive_prefix = NULL;
+static PsxCar s_psx_car;
+static PsxBridge s_psx_bridge;
+static PsxTrackIface s_psx_iface;
+static int s_psx_active = 0;
+static double s_psx_accum = 0.0;
+/* Persists across HUD updates so physics_find_section_local_walk (round
+ * 11 -- see physics.h) can do its cheap incremental walk instead of a
+ * fresh O(n) search every time; -1 means "not seeded yet", which makes
+ * the first call cold-start via physics_find_nearest_section. */
+static int s_physics_section_index = -1;
+
 static void track_view_reset_top(void) {
     s_track_zoom = 1.0;
     s_track_pan_x = 0.0;
     s_track_pan_z = 0.0;
+}
+
+
+/* ROUND 59: the CONFIRMED frame conversion. idx_hed now returns the
+ * game's MESH-frame cell origin ((30 - file_col)*2048, row*2048); our
+ * whole port (physics, cars, camera) lives in the trackdata/physics
+ * frame, which the game itself maps as x_phys = 61440 - x_mesh
+ * (D_801733A0 = 0xF000, func_800181C8/func_80015CD4). So every MAP
+ * vert converts as PHYS_X = 61440 - (origin + vx); z passes through.
+ * Validated on the 12 real grid anchors + 232/256 section centers
+ * (see idx_hed.c). */
+#define MAP_PHYS_X(ox, vx) (61440.0 - (double)(ox) - (double)(vx))
+
+/* ROUND 53: generic deck sampler (extracted from the round-46 camera
+ * ground sampler): point-in-quad over the real-road B records, deck
+ * disambiguation by continuity against *prev when seeded, nearest-
+ * corner fallback. Returns the smoothed deck height. */
+static double ground_sample_at(const TrackDemo *td, double smp_x,
+                               double smp_z, double prev, int *seeded)
+{
+    const MapRrmFile *mf = &td->mf;
+    const IdxHedFile *idxf = &td->idxf;
+    double best_contained = 1e30, contained_y = 0.0;
+    int have_contained = 0;
+    double best_near = 1e30, near_y = prev;
+    size_t rr;
+    for (rr = 0; rr < mf->record_count; rr++) {
+        const MapRrmTaggedRecord *tr2 = &mf->records[rr];
+        int32_t ox2, oz2;
+        double qx[4], qz[4], qy;
+        double dx2, dz2, d2;
+        int c2, pos = 0, neg = 0;
+        if (tr2->type != MAP_RRM_RECORD_TYPE_B) continue;
+        /* ROUND 54: no section filter (see the draw loop note) */
+        if (idx_hed_section_world_origin(idxf, tr2->section_index, &ox2, &oz2) != IDX_HED_OK) continue;
+        qx[0] = MAP_PHYS_X(ox2, tr2->rec.v0[0]); qz[0] = oz2 + tr2->rec.v0[2];
+        qx[1] = MAP_PHYS_X(ox2, tr2->rec.v1[0]); qz[1] = oz2 + tr2->rec.v1[2];
+        qx[2] = MAP_PHYS_X(ox2, tr2->rec.v3[0]); qz[2] = oz2 + tr2->rec.v3[2];
+        qx[3] = MAP_PHYS_X(ox2, tr2->rec.v2[0]); qz[3] = oz2 + tr2->rec.v2[2];
+        qy = ((double)tr2->rec.v0[1] + tr2->rec.v1[1] +
+              tr2->rec.v2[1] + tr2->rec.v3[1]) * 0.25;
+        dx2 = qx[0] - smp_x; dz2 = qz[0] - smp_z;
+        d2 = dx2 * dx2 + dz2 * dz2;
+        if (*seeded) {
+            double dy2 = qy - prev;
+            d2 += dy2 * dy2 * 16.0;
+        }
+        if (d2 < best_near) { best_near = d2; near_y = qy; }
+        for (c2 = 0; c2 < 4; c2++) {
+            int n2 = (c2 + 1) & 3;
+            double cr = (qx[n2] - qx[c2]) * (smp_z - qz[c2])
+                      - (qz[n2] - qz[c2]) * (smp_x - qx[c2]);
+            if (cr >= 0) pos++;
+            if (cr <= 0) neg++;
+        }
+        if (pos == 4 || neg == 4) {
+            double dy2 = *seeded ? (qy - prev) : 0.0;
+            double score = dy2 * dy2;
+            if (score < best_contained) {
+                best_contained = score;
+                contained_y = qy;
+                have_contained = 1;
+            }
+        }
+    }
+    {
+        double target = have_contained ? contained_y : near_y;
+        if (!*seeded) { *seeded = 1; return target; }
+        return prev + (target - prev) * 0.35;
+    }
 }
 
 /* Pass over the same record set draw_track_demo_scene()/
@@ -414,7 +907,7 @@ static int track_demo_world_bbox(const TrackDemo *td, double *ominx, double *oma
         if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
         for (c = 0; c < 4; c++) {
             const int16_t *v = (c == 0) ? tr->rec.v0 : (c == 1) ? tr->rec.v1 : (c == 2) ? tr->rec.v2 : tr->rec.v3;
-            double wx = ox + v[0], wz = oz + v[2];
+            double wx = MAP_PHYS_X(ox, v[0]), wz = oz + v[2];
             if (wx < minx) minx = wx;
             if (wx > maxx) maxx = wx;
             if (wz < minz) minz = wz;
@@ -510,7 +1003,7 @@ static void track_view_build_autopilot_path(const TrackDemo *td) {
         if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
         if (tr->section_index >= mf->section_count) continue;
         if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
-        sum_x[tr->section_index] += ox + tr->rec.v0[0];
+        sum_x[tr->section_index] += MAP_PHYS_X(ox, tr->rec.v0[0]);
         sum_z[tr->section_index] += oz + tr->rec.v0[2];
         count[tr->section_index]++;
     }
@@ -688,10 +1181,10 @@ static void draw_track_demo_scene(const TrackDemo *td) {
         if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
 
         /* v0,v1,v3,v2 perimeter order (note v3 before v2). */
-        wx0 = ox + tr->rec.v0[0]; wz0 = oz + tr->rec.v0[2];
-        wx1 = ox + tr->rec.v1[0]; wz1 = oz + tr->rec.v1[2];
-        wx2 = ox + tr->rec.v3[0]; wz2 = oz + tr->rec.v3[2];
-        wx3 = ox + tr->rec.v2[0]; wz3 = oz + tr->rec.v2[2];
+        wx0 = MAP_PHYS_X(ox, tr->rec.v0[0]); wz0 = oz + tr->rec.v0[2];
+        wx1 = MAP_PHYS_X(ox, tr->rec.v1[0]); wz1 = oz + tr->rec.v1[2];
+        wx2 = MAP_PHYS_X(ox, tr->rec.v3[0]); wz2 = oz + tr->rec.v3[2];
+        wx3 = MAP_PHYS_X(ox, tr->rec.v2[0]); wz3 = oz + tr->rec.v2[2];
 
         x0 = (int)((wx0 - cx) * scale) + GPU_FB_WIDTH / 2;
         y0 = (int)((wz0 - cz) * scale) + GPU_FB_HEIGHT / 2;
@@ -724,9 +1217,13 @@ typedef struct {
     /* Per-vertex UVs, only meaningful/used when the scene has a road
      * texture (td->tex_rgba != NULL) -- see draw_track_drive_scene. */
     float u0, v0, u1, v1, u2, v2, u3, v3;
+    /* ROUND 45: real per-quad texture page (from the record's OWN
+     * tpage/clut/UV fields) -- NULL means draw flat with .color. */
+    const uint32_t *page_rgba;
+    uint32_t mod; /* ROUND 52: 0xRRGGBB texel modulation (fog/lighting) */
 } TrackDriveQuadJob;
 
-#define TRACK_DRIVE_MAX_QUADS 8192
+#define TRACK_DRIVE_MAX_QUADS 12288
 static TrackDriveQuadJob s_track_drive_jobs[TRACK_DRIVE_MAX_QUADS];
 
 static int track_drive_job_cmp(const void *pa, const void *pb) {
@@ -757,74 +1254,485 @@ static void draw_track_drive_scene(const TrackDemo *td) {
      * GPU_FB_WIDTH-wide framebuffer. */
     double focal = (GPU_FB_WIDTH / 2.0) / tan(80.0 * 3.14159265358979 / 180.0 / 2.0);
     const double near_plane = 20.0;   /* world units; vertices closer than this are dropped */
-    const double far_fog = 6000.0;    /* world units; distance fog fades to background by here */
+    const double far_fog = 9000.0;    /* world units; distance fog fades to background by here */
     /* Screen coords are clamped to this before handing to
      * gpu_draw_quad_flat -- keeps the int edge-function math in
      * gpu_soft.c (see gpu_draw_triangle_flat) well inside int32 range
      * even for near-camera geometry that projects far off-screen,
      * while still being well outside the visible framebuffer. */
     const int coord_clamp = 20000;
+    /* ROUND 44: camera ground height from the road records under the
+     * camera -- MAP.RRM type-B records carry REAL per-corner heights
+     * (v[1], PS1 y-down: negative = raised road), previously ignored
+     * (flat-plane simplification). Sampled from the nearest section's
+     * B-run so hills/tunnel dips move the horizon like they should. */
+    {
+        /* ROUND 46 ground sampler v2 -- ROUND 53: extracted into
+         * ground_sample_at() (also used per-AI-car below); sampled at
+         * the CAR when it exists, since the chase camera legitimately
+         * hangs past the road edge in corners. */
+        double smp_x = s_car_draw_on ? s_car_draw_x : s_cam_x;
+        double smp_z = s_car_draw_on ? s_car_draw_z : s_cam_z;
+        s_ground_y = ground_sample_at(td, smp_x, smp_z, s_ground_y,
+                                      &s_ground_seeded);
+    }
 
-    gpu_clear(0x00080810);
+    /* ROUND 44: sky -- vertical gradient bands above the horizon
+     * (deep blue high, warm haze at the horizon line), drawn first so
+     * every road quad paints over it. Horizon sits at mid-screen
+     * (flat-projection convention of this camera). */
+    {
+        int band, nbands = 12, horizon = GPU_FB_HEIGHT / 2;
+        for (band = 0; band < nbands; band++) {
+            int y0b = band * horizon / nbands;
+            int y1b = (band + 1) * horizon / nbands;
+            double t = (double)band / (nbands - 1);
+            int rr8 = (int)(24 + t * (110 - 24));
+            int gg8 = (int)(40 + t * (140 - 40));
+            int bb8 = (int)(96 + t * (176 - 96));
+            uint32_t c = ((uint32_t)rr8 << 16) | ((uint32_t)gg8 << 8) | (uint32_t)bb8;
+            gpu_draw_quad_flat(0, y0b, GPU_FB_WIDTH, y0b, GPU_FB_WIDTH, y1b, 0, y1b, c);
+        }
+        /* ground below the horizon: dark neutral */
+        gpu_draw_quad_flat(0, horizon, GPU_FB_WIDTH, horizon,
+                           GPU_FB_WIDTH, GPU_FB_HEIGHT, 0, GPU_FB_HEIGHT,
+                           0x00202428);
+    }
 
     for (r = 0; r < mf->record_count && njobs < TRACK_DRIVE_MAX_QUADS; r++) {
         const MapRrmTaggedRecord *tr = &mf->records[r];
         int32_t ox, oz;
         int c, behind = 0;
-        double rightv[4], depthv[4];
+        double rightv[4], depthv[4], heightv[4];
         float uv_u[4], uv_v[4];
         double avg_depth = 0.0;
         int px[4], py[4];
         int fog;
         uint32_t color;
 
-        if (tr->type != MAP_RRM_RECORD_TYPE_B) continue;
-        if (!track_demo_is_real_road_section(mf, tr->section_index)) continue;
+        /* ROUND 53: MAP.RRM record types A and C turn out to be the
+         * SAME 40-byte textured-quad format as type B (4 verts + the
+         * round-45 texture tail; verified by field-range scan on the
+         * real file: the tail words decode to valid CLUT/TPAGE ids).
+         * They are the SCENERY -- cliff faces, building sides, tunnel
+         * walls -- that the drive view was silently skipping. Draw
+         * all three streams; the ground sampler stays B-only (roads). */
+        if (tr->type != MAP_RRM_RECORD_TYPE_A &&
+            tr->type != MAP_RRM_RECORD_TYPE_B &&
+            tr->type != MAP_RRM_RECORD_TYPE_C) continue;
+        /* ROUND 54: the ">2 records" section filter is GONE here --
+         * it excluded 61 of 258 sections (a simple straight is a
+         * single road quad), which was the "dark zone" around
+         * sections 40-42 and every other missing patch of road. */
         if (idx_hed_section_world_origin(idxf, tr->section_index, &ox, &oz) != IDX_HED_OK) continue;
+
+        /* ROUND 53: cheap distance cull -- a quad whose first corner
+         * sits beyond the fog wall can only rasterize as background
+         * anyway; skipping it keeps the quad budget for what's
+         * visible now that the A/C scenery streams are in. */
+        {
+            double ddx = MAP_PHYS_X(ox, tr->rec.v0[0]) - s_cam_x;
+            double ddz = (oz + tr->rec.v0[2]) - s_cam_z;
+            if (ddx * ddx + ddz * ddz > (far_fog + 1200.0) * (far_fog + 1200.0))
+                continue;
+        }
 
         for (c = 0; c < 4; c++) {
             /* v0,v1,v3,v2 perimeter order, same convention as the
              * top-down view's pass 2. */
             const int16_t *v = (c == 0) ? tr->rec.v0 : (c == 1) ? tr->rec.v1 : (c == 2) ? tr->rec.v3 : tr->rec.v2;
-            double wx = ox + v[0], wz = oz + v[2];
+            double wx = MAP_PHYS_X(ox, v[0]), wz = oz + v[2];
             double dx = wx - s_cam_x, dz = wz - s_cam_z;
             rightv[c] = dx * cos_yaw - dz * sin_yaw;
             depthv[c] = dx * sin_yaw + dz * cos_yaw;
-            if (depthv[c] <= near_plane) behind = 1;
+            /* ROUND 44: real height relative to the camera's ground
+             * sample (PS1 y-down), camera riding s_cam_height above. */
+            heightv[c] = ((double)v[1] - s_ground_y) + s_cam_height;
+            if (depthv[c] <= near_plane) behind++;
             avg_depth += depthv[c];
             uv_u[c] = track_tile_uv(wx);
             uv_v[c] = track_tile_uv(wz);
         }
-        if (behind) continue; /* simple near-plane cull, no clipping -- see file header comment */
-        avg_depth /= 4.0;
+        /* ROUND 47: REAL near-plane polygon clipping (Sutherland-
+         * Hodgman against depth == near_plane, camera space, UVs
+         * interpolated) -- replaces the any-vertex-behind cull that
+         * left a gray hole in the immediate foreground. Produces up to
+         * 5 vertices; drawn as a triangle fan below (a "quad" job with
+         * its last vertex duplicated rasterizes as a triangle). */
+        {
+            double cr[8], ch[8], cd[8];
+            float cu[8], cv[8];
+            int n_out = 0;
+            /* fetch this record's real UVs up front (or tiling UVs) so
+             * clipping interpolates the right values */
+            float ru[4], rv[4];
+            const uint32_t *pg = NULL;
+            if (s_vram_loaded) {
+                uint16_t rclut = tr->rec.heading;
+                uint16_t rtpage = (uint16_t)tr->rec.unk_1e;
+                pg = vram_page_get(rtpage, rclut);
+            }
+            if (pg != NULL) {
+                uint16_t w0 = (uint16_t)tr->rec.unk_18;
+                uint16_t w1 = (uint16_t)tr->rec.unk_1c;
+                uint16_t w2 = (uint16_t)tr->rec.unk_20;
+                uint16_t w3 = (uint16_t)tr->rec.unk_24;
+                /* perimeter order v0,v1,v3,v2 <-> uv0,uv1,uv3,uv2 */
+                ru[0] = (float)(w0 & 0xFF) / 255.0f; rv[0] = (float)(w0 >> 8) / 255.0f;
+                ru[1] = (float)(w1 & 0xFF) / 255.0f; rv[1] = (float)(w1 >> 8) / 255.0f;
+                ru[2] = (float)(w2 & 0xFF) / 255.0f; rv[2] = (float)(w2 >> 8) / 255.0f;
+                ru[3] = (float)(w3 & 0xFF) / 255.0f; rv[3] = (float)(w3 >> 8) / 255.0f;
+            } else {
+                ru[0] = uv_u[0]; rv[0] = uv_v[0];
+                ru[1] = uv_u[1]; rv[1] = uv_v[1];
+                ru[2] = uv_u[2]; rv[2] = uv_v[2];
+                ru[3] = uv_u[3]; rv[3] = uv_v[3];
+            }
+            if (behind == 4)
+                continue;
+            if (behind == 0) {
+                for (c = 0; c < 4; c++) {
+                    cr[c] = rightv[c]; ch[c] = heightv[c]; cd[c] = depthv[c];
+                    cu[c] = ru[c]; cv[c] = rv[c];
+                }
+                n_out = 4;
+            } else {
+                for (c = 0; c < 4; c++) {
+                    int nxt = (c + 1) & 3;
+                    int ain = depthv[c] > near_plane;
+                    int bin = depthv[nxt] > near_plane;
+                    if (ain) {
+                        cr[n_out] = rightv[c]; ch[n_out] = heightv[c];
+                        cd[n_out] = depthv[c];
+                        cu[n_out] = ru[c]; cv[n_out] = rv[c];
+                        n_out++;
+                    }
+                    if (ain != bin) {
+                        double t = (near_plane - depthv[c]) /
+                                   (depthv[nxt] - depthv[c]);
+                        cr[n_out] = rightv[c] + (rightv[nxt] - rightv[c]) * t;
+                        ch[n_out] = heightv[c] + (heightv[nxt] - heightv[c]) * t;
+                        cd[n_out] = near_plane;
+                        cu[n_out] = ru[c] + (float)((ru[nxt] - ru[c]) * t);
+                        cv[n_out] = rv[c] + (float)((rv[nxt] - rv[c]) * t);
+                        n_out++;
+                    }
+                }
+                if (n_out < 3)
+                    continue;
+            }
+            avg_depth = 0.0;
+            for (c = 0; c < n_out; c++)
+                avg_depth += cd[c];
+            avg_depth /= n_out;
 
-        for (c = 0; c < 4; c++) {
-            px[c] = (int)((rightv[c] / depthv[c]) * focal) + GPU_FB_WIDTH / 2;
-            py[c] = (int)((s_cam_height / depthv[c]) * focal) + GPU_FB_HEIGHT / 2;
-            if (px[c] < -coord_clamp) px[c] = -coord_clamp;
-            if (px[c] > coord_clamp) px[c] = coord_clamp;
-            if (py[c] < -coord_clamp) py[c] = -coord_clamp;
-            if (py[c] > coord_clamp) py[c] = coord_clamp;
+            /* fog + material tint (unchanged from rounds 44-45) */
+            fog = (int)(255.0 * (1.0 - avg_depth / far_fog));
+            if (fog < 110) fog = 110;
+            if (fog > 255) fog = 255;
+            {
+                int g = (int)(int16_t)tr->rec.group_id;
+                int t1 = ((g * 73) & 0x1F) - 16;
+                int t2 = ((g * 131) & 0x1F) - 16;
+                int rb = 0x74 + t1, gb = 0x78 + t2, bb = 0x7C + (t1 + t2) / 2;
+                if (rb < 24) rb = 24;
+                if (rb > 200) rb = 200;
+                if (gb < 24) gb = 24;
+                if (gb > 200) gb = 200;
+                if (bb < 24) bb = 24;
+                if (bb > 200) bb = 200;
+                color = ((uint32_t)((rb * fog) / 255) << 16) |
+                        ((uint32_t)((gb * fog) / 255) << 8) |
+                        (uint32_t)((bb * fog) / 255);
+            }
+
+            /* project + emit triangle fan */
+            {
+                int sx[8], sy[8], k;
+                double sort_depth = avg_depth
+                    + (double)(int16_t)tr->rec.group_id * 8.0;
+                for (c = 0; c < n_out; c++) {
+                    sx[c] = (int)((cr[c] / cd[c]) * focal) + GPU_FB_WIDTH / 2;
+                    sy[c] = (int)((ch[c] / cd[c]) * focal) + GPU_FB_HEIGHT / 2;
+                    if (sx[c] < -coord_clamp) sx[c] = -coord_clamp;
+                    if (sx[c] > coord_clamp) sx[c] = coord_clamp;
+                    if (sy[c] < -coord_clamp) sy[c] = -coord_clamp;
+                    if (sy[c] > coord_clamp) sy[c] = coord_clamp;
+                }
+                for (k = 1; k + 1 < n_out && njobs < TRACK_DRIVE_MAX_QUADS; k++) {
+                    TrackDriveQuadJob *jb = &s_track_drive_jobs[njobs];
+                    jb->mod = ((uint32_t)fog << 16) | ((uint32_t)fog << 8)
+                            | (uint32_t)fog; /* distance haze */
+                    jb->depth = sort_depth;
+                    jb->x0 = sx[0]; jb->y0 = sy[0];
+                    jb->x1 = sx[k]; jb->y1 = sy[k];
+                    jb->x2 = sx[k + 1]; jb->y2 = sy[k + 1];
+                    jb->x3 = sx[k + 1]; jb->y3 = sy[k + 1]; /* degenerate = triangle */
+                    jb->color = color;
+                    jb->page_rgba = pg;
+                    jb->u0 = cu[0]; jb->v0 = cv[0];
+                    jb->u1 = cu[k]; jb->v1 = cv[k];
+                    jb->u2 = cu[k + 1]; jb->v2 = cv[k + 1];
+                    jb->u3 = cu[k + 1]; jb->v3 = cv[k + 1];
+                    njobs++;
+                }
+            }
+            continue; /* fan emitted -- skip the legacy single-quad path */
         }
 
         fog = (int)(255.0 * (1.0 - avg_depth / far_fog));
-        if (fog < 40) fog = 40;
+        if (fog < 110) fog = 110;
         if (fog > 255) fog = 255;
-        color = ((uint32_t)((0x3C * fog) / 255) << 16) |
-                ((uint32_t)((0x96 * fog) / 255) << 8) |
-                (uint32_t)((0x5A * fog) / 255);
+        /* ROUND 44: material tint from the record's group_id (the
+         * stepped "material id" candidate field -- 30 distinct values
+         * in the shipped course). Base = asphalt gray; the id hashes
+         * to a subtle stable tint so different road materials (bridge,
+         * tunnel, beach front...) read as different surfaces. Mapping
+         * group_id to its REAL texture page is the documented next
+         * step (needs the PS1 render-loop consumer trace). */
+        {
+            int g = (int)(int16_t)tr->rec.group_id;
+            int t1 = ((g * 73) & 0x1F) - 16; /* -16..15 stable tint */
+            int t2 = ((g * 131) & 0x1F) - 16;
+            int rb = 0x74 + t1, gb = 0x78 + t2, bb = 0x7C + (t1 + t2) / 2;
+            if (rb < 24) rb = 24;
+            if (rb > 200) rb = 200;
+            if (gb < 24) gb = 24;
+            if (gb > 200) gb = 200;
+            if (bb < 24) bb = 24;
+            if (bb > 200) bb = 200;
+            color = ((uint32_t)((rb * fog) / 255) << 16) |
+                    ((uint32_t)((gb * fog) / 255) << 8) |
+                    (uint32_t)((bb * fog) / 255);
+        }
 
-        s_track_drive_jobs[njobs].depth = avg_depth;
+        /* ROUND 46: fold in the record's own ordering-table bias
+         * (bytes 34-35, decoded round 45) -- the game's way of
+         * layering decks/bridges; one OT step ~ a few world units. */
+        s_track_drive_jobs[njobs].depth = avg_depth
+            + (double)(int16_t)tr->rec.group_id * 8.0;
         s_track_drive_jobs[njobs].x0 = px[0]; s_track_drive_jobs[njobs].y0 = py[0];
         s_track_drive_jobs[njobs].x1 = px[1]; s_track_drive_jobs[njobs].y1 = py[1];
         s_track_drive_jobs[njobs].x2 = px[2]; s_track_drive_jobs[njobs].y2 = py[2];
         s_track_drive_jobs[njobs].x3 = px[3]; s_track_drive_jobs[njobs].y3 = py[3];
         s_track_drive_jobs[njobs].color = color;
-        s_track_drive_jobs[njobs].u0 = uv_u[0]; s_track_drive_jobs[njobs].v0 = uv_v[0];
-        s_track_drive_jobs[njobs].u1 = uv_u[1]; s_track_drive_jobs[njobs].v1 = uv_v[1];
-        s_track_drive_jobs[njobs].u2 = uv_u[2]; s_track_drive_jobs[njobs].v2 = uv_v[2];
-        s_track_drive_jobs[njobs].u3 = uv_u[3]; s_track_drive_jobs[njobs].v3 = uv_v[3];
+        s_track_drive_jobs[njobs].page_rgba = NULL;
+        if (s_vram_loaded) {
+            /* ROUND 45: the record's OWN texture reference -- bytes
+             * 24-39 decoded via func_8003486C's POLY_FT4 copy (see
+             * psx_vram.h). Corner order: record v0,v1,v3,v2 is this
+             * renderer's perimeter order, so UVs pair up the same way:
+             * uv0,uv1,uv3,uv2. */
+            uint16_t rclut = tr->rec.heading;          /* bytes 26-27 */
+            uint16_t rtpage = (uint16_t)tr->rec.unk_1e;/* bytes 30-31 */
+            const uint32_t *pg = vram_page_get(rtpage, rclut);
+            if (pg != NULL) {
+                uint16_t w0 = (uint16_t)tr->rec.unk_18; /* u0,v0 */
+                uint16_t w1 = (uint16_t)tr->rec.unk_1c; /* u1,v1 */
+                uint16_t w2 = (uint16_t)tr->rec.unk_20; /* u2,v2 */
+                uint16_t w3 = (uint16_t)tr->rec.unk_24; /* u3,v3 */
+                s_track_drive_jobs[njobs].page_rgba = pg;
+                s_track_drive_jobs[njobs].u0 = (float)(w0 & 0xFF) / 255.0f;
+                s_track_drive_jobs[njobs].v0 = (float)(w0 >> 8) / 255.0f;
+                s_track_drive_jobs[njobs].u1 = (float)(w1 & 0xFF) / 255.0f;
+                s_track_drive_jobs[njobs].v1 = (float)(w1 >> 8) / 255.0f;
+                s_track_drive_jobs[njobs].u3 = (float)(w2 & 0xFF) / 255.0f;
+                s_track_drive_jobs[njobs].v3 = (float)(w2 >> 8) / 255.0f;
+                s_track_drive_jobs[njobs].u2 = (float)(w3 & 0xFF) / 255.0f;
+                s_track_drive_jobs[njobs].v2 = (float)(w3 >> 8) / 255.0f;
+            }
+        }
+        if (s_track_drive_jobs[njobs].page_rgba == NULL) {
+            s_track_drive_jobs[njobs].u0 = uv_u[0]; s_track_drive_jobs[njobs].v0 = uv_v[0];
+            s_track_drive_jobs[njobs].u1 = uv_u[1]; s_track_drive_jobs[njobs].v1 = uv_v[1];
+            s_track_drive_jobs[njobs].u2 = uv_u[2]; s_track_drive_jobs[njobs].v2 = uv_v[2];
+            s_track_drive_jobs[njobs].u3 = uv_u[3]; s_track_drive_jobs[njobs].v3 = uv_v[3];
+        }
         njobs++;
+    }
+
+    /* ROUND 51: the visible car -- object model type-64 prims (4 verts
+     * + 4 Q12 normals + texture tail), rotated by the car heading,
+     * scaled (approximated factor, see obj_load), placed at the car
+     * pose, and pushed through the SAME projection/clip/texture path
+     * as the track quads. */
+    if (s_obj_buf != NULL) {
+        int ci;
+        for (ci = 0; ci < MAX_DRAW_CARS; ci++) {
+        CarDraw *cd = &s_draw_cars[ci];
+        if (!cd->on || (uint32_t)cd->model >= s_obj_count)
+            continue;
+        /* ROUND 53: per-car deck height -- each AI car samples the
+         * ground at ITS OWN position (with its own overpass
+         * continuity), instead of inheriting the camera's deck. */
+        if (ci != 0)
+            cd->y = ground_sample_at(td, cd->x, cd->z, cd->y,
+                                     &cd->y_seeded);
+        {
+        /* ROUND 52: the car is drawn as PIECES -- body + two full
+         * AXLE objects spinning around X with the authentic wheel
+         * angle (car+0x38). ROUND 53: the pieces now come from the
+         * game's own per-model kit table D_80059228 (traced in the
+         * car renderer func_8002128C): body object, axle object
+         * (36/37/38 per model class) drawn once at the car origin and
+         * once at the rear offset the table stores, the far LOD
+         * object beyond Manhattan camera distance 0xD00, and a full
+         * cull past 0x2500. */
+        struct { int obj; int dz; int dy; int spin; } pieces[3];
+        int pi, npieces;
+        /* ROUND 53: model z runs NOSE-BACKWARD relative to our world
+         * forward -- drawing it raw showed the nose to the chase
+         * camera WITH mirrored livery text, the signature of a z-axis
+         * reflection (the game's renderer bakes the equivalent into
+         * its 0x800-minus-heading matrix convention). Mirror model z
+         * (verts and normals) and keep the heading direct. */
+        double hb = (double)(cd->heading & 0xFFF) / 4096.0 * 6.283185307179586;
+        double ch2 = cos(hb), sh2 = sin(hb);
+        double rb = (double)((cd->roll << 20) >> 20) / 4096.0 * 6.283185307179586;
+        double crl = cos(rb), srl = sin(rb);
+        double man = fabs(cd->x - s_cam_x) + fabs(cd->z - s_cam_z);
+        if (psx_ai_kit_loaded && cd->model >= 0 &&
+            cd->model < PSX_AI_KIT_MODELS) {
+            const PsxCarKit *kt = &psx_ai_kit[cd->model];
+            if (ci != 0 && man > 9472.0)
+                continue; /* 0x2500: cull (func_8002128C) */
+            if (ci != 0 && man > 3328.0) {
+                /* 0xD00: single-piece LOD */
+                pieces[0].obj = kt->lod_obj; pieces[0].dz = 0;
+                pieces[0].dy = 0; pieces[0].spin = 0;
+                npieces = 1;
+            } else {
+                pieces[0].obj = kt->body_obj; pieces[0].dz = 0;
+                pieces[0].dy = 0; pieces[0].spin = 0;
+                /* ROUND 56: axles ride slightly high in model space
+                 * (-14, y-down) so the wheel rims meet the ground
+                 * instead of sinking under the body line. */
+                pieces[1].obj = kt->axle_obj; pieces[1].dz = 0;
+                pieces[1].dy = -14; pieces[1].spin = 1;
+                pieces[2].obj = kt->axle_obj;
+                pieces[2].dz = kt->axle_dz_model; /* rear (-335 etc.) */
+                pieces[2].dy = -14; pieces[2].spin = 1;
+                npieces = 3;
+            }
+        } else {
+            /* no kit (no --physicsdata): round-52 fallback */
+            pieces[0].obj = cd->model; pieces[0].dz = 0; pieces[0].dy = 0;
+            pieces[0].spin = 0;
+            pieces[1].obj = 36; pieces[1].dz = 40; pieces[1].dy = -14;
+            pieces[1].spin = 1;
+            pieces[2].obj = 36; pieces[2].dz = -350; pieces[2].dy = -14;
+            pieces[2].spin = 1;
+            npieces = 3;
+        }
+        for (pi = 0; pi < npieces; pi++) {
+        int piece_model = pieces[pi].obj;
+        uint32_t base;
+        if (piece_model < 0 || (uint32_t)piece_model >= s_obj_count)
+            continue;
+        base = s_obj_data_off[piece_model];
+        int16_t n64 = obj_cnt((uint32_t)piece_model, 3);
+        uint32_t o = base + (uint32_t)obj_cnt(piece_model, 0) * 40u
+                          + (uint32_t)obj_cnt(piece_model, 1) * 48u
+                          + (uint32_t)obj_cnt(piece_model, 2) * 32u;
+        double wb = (double)(cd->wheel & 0xFFF) / 4096.0 * 6.283185307179586;
+        double cw2 = cos(wb), sw2 = sin(wb);
+        int k;
+        for (k = 0; k < n64 && njobs < TRACK_DRIVE_MAX_QUADS; k++) {
+            const uint8_t *rec = s_obj_buf + o + (uint32_t)k * 64u;
+            double wr[4], wh[4], wd[4];
+            float wu[4], wv[4];
+            uint16_t tail[8];
+            const uint32_t *pg = NULL;
+            int c2, behind2 = 0;
+            double avg2 = 0.0;
+            uint32_t car_mod = 0xFFFFFFu;
+            int t;
+            for (t = 0; t < 8; t++)
+                tail[t] = (uint16_t)(rec[48 + t * 2] | (rec[49 + t * 2] << 8));
+            if (s_vram_loaded)
+                pg = vram_page_get(tail[3], tail[1]);
+            {
+                /* ROUND 52: gouraud-style lighting from the prim's Q12
+                 * normals (per-quad, normal 0), sun from high front-left
+                 * (y-down world). Shade range keeps blacks readable. */
+                int16_t nx0 = (int16_t)(rec[24] | (rec[25] << 8));
+                int16_t ny0 = (int16_t)(rec[26] | (rec[27] << 8));
+                int16_t nz0 = (int16_t)-(int16_t)(rec[28] | (rec[29] << 8));
+                double wnx = (nz0 / 4096.0) * ch2 - (nx0 / 4096.0) * sh2;
+                double wnz = (nz0 / 4096.0) * sh2 + (nx0 / 4096.0) * ch2;
+                double wny = ny0 / 4096.0;
+                double d = wnx * -0.35 + wny * -0.85 + wnz * 0.20;
+                int sh = (int)(150.0 + 105.0 * (d > 0 ? d : 0));
+                if (sh > 255) sh = 255;
+                car_mod = ((uint32_t)sh << 16) | ((uint32_t)sh << 8) | (uint32_t)sh;
+            }
+            for (c2 = 0; c2 < 4; c2++) {
+                /* perimeter order 0,1,3,2 like the track quads */
+                int vi = (c2 == 0) ? 0 : (c2 == 1) ? 1 : (c2 == 2) ? 3 : 2;
+                int16_t mx = (int16_t)(rec[vi * 6] | (rec[vi * 6 + 1] << 8));
+                int16_t my = (int16_t)(rec[vi * 6 + 2] | (rec[vi * 6 + 3] << 8));
+                int16_t mz = (int16_t)(rec[vi * 6 + 4] | (rec[vi * 6 + 5] << 8));
+                double pmx = (double)mx, pmy = (double)my, pmz = -(double)mz;
+                if (pieces[pi].spin) {
+                    /* axle spin about X with the authentic wheel angle */
+                    double ry = pmy * cw2 - pmz * sw2;
+                    double rz = pmy * sw2 + pmz * cw2;
+                    pmy = ry; pmz = rz;
+                }
+                pmz += (double)pieces[pi].dz;
+                pmy += (double)pieces[pi].dy;
+                /* ROUND 53: corner lean -- the AI renderer feeds +0x28
+                 * into a Z-rotation (roll about the forward axis). */
+                if (cd->roll != 0) {
+                    double rx = pmx * crl - pmy * srl;
+                    double ry2 = pmx * srl + pmy * crl;
+                    pmx = rx; pmy = ry2;
+                }
+                /* model +z = forward; rotate about Y (y-down world) */
+                double lx = pmx * s_car_model_scale;
+                double ly = pmy * s_car_model_scale;
+                double lz = pmz * s_car_model_scale;
+                double wx = cd->x + lz * ch2 - lx * sh2;
+                double wz = cd->z + lz * sh2 + lx * ch2;
+                double wy = (ci == 0 ? s_ground_y : cd->y) + ly - 6.0;
+                double dx = wx - s_cam_x, dz = wz - s_cam_z;
+                int uvi = (c2 == 3) ? 2 : (c2 == 2) ? 3 : c2;
+                wr[c2] = dx * cos_yaw - dz * sin_yaw;
+                wd[c2] = dx * sin_yaw + dz * cos_yaw;
+                wh[c2] = (wy - s_ground_y) + s_cam_height;
+                if (wd[c2] <= near_plane) behind2 = 1;
+                avg2 += wd[c2];
+                wu[c2] = (float)(tail[uvi * 2] & 0xFF) / 255.0f;
+                wv[c2] = (float)(tail[uvi * 2] >> 8) / 255.0f;
+            }
+            if (behind2) continue;
+            avg2 /= 4.0;
+            {
+                TrackDriveQuadJob *jb = &s_track_drive_jobs[njobs];
+                int c3;
+                int qx[4], qy[4];
+                for (c3 = 0; c3 < 4; c3++) {
+                    qx[c3] = (int)((wr[c3] / wd[c3]) * focal) + GPU_FB_WIDTH / 2;
+                    qy[c3] = (int)((wh[c3] / wd[c3]) * focal) + GPU_FB_HEIGHT / 2;
+                }
+                jb->depth = avg2 - 2.0; /* nudge in front of coplanar road */
+                jb->x0 = qx[0]; jb->y0 = qy[0];
+                jb->x1 = qx[1]; jb->y1 = qy[1];
+                jb->x2 = qx[2]; jb->y2 = qy[2];
+                jb->x3 = qx[3]; jb->y3 = qy[3];
+                jb->page_rgba = pg;
+                jb->mod = car_mod;
+                jb->color = 0x00C03030;
+                jb->u0 = wu[0]; jb->v0 = wv[0];
+                jb->u1 = wu[1]; jb->v1 = wv[1];
+                jb->u2 = wu[2]; jb->v2 = wv[2];
+                jb->u3 = wu[3]; jb->v3 = wv[3];
+                njobs++;
+            }
+        }
+        } /* pieces */
+        }
+        } /* cars */
     }
 
     qsort(s_track_drive_jobs, (size_t)njobs, sizeof(s_track_drive_jobs[0]), track_drive_job_cmp);
@@ -838,6 +1746,13 @@ static void draw_track_drive_scene(const TrackDemo *td) {
                                     j->x2, j->y2, j->u2, j->v2,
                                     j->x3, j->y3, j->u3, j->v3,
                                     td->tex_rgba, td->tex_w, td->tex_h);
+        } else if (j->page_rgba != NULL) {
+            /* ROUND 45: the quad's real texture page */
+            gpu_draw_quad_textured(j->x0, j->y0, j->u0, j->v0,
+                                    j->x1, j->y1, j->u1, j->v1,
+                                    j->x2, j->y2, j->u2, j->v2,
+                                    j->x3, j->y3, j->u3, j->v3,
+                                    j->page_rgba, 256, 256);
         } else {
             gpu_draw_quad_flat(j->x0, j->y0, j->x1, j->y1, j->x2, j->y2, j->x3, j->y3, j->color);
         }
@@ -845,15 +1760,171 @@ static void draw_track_drive_scene(const TrackDemo *td) {
 }
 
 /* Dispatches to whichever track-demo view mode is active. */
+static int s_hud_lap = 0; /* player lap, wrapped by the loops below */
 static void draw_track_view(const TrackDemo *td) {
     if (s_track_view_mode == TRACK_VIEW_DRIVE) {
         draw_track_drive_scene(td);
+        if (s_psx_active)
+            draw_race_hud(s_psx_car.speed, (int)s_psx_car.gear, s_hud_lap + 1,
+                          s_psx_car.rpm);
     } else {
         draw_track_demo_scene(td);
     }
 }
 
 #ifdef HAVE_SDL2
+/* ROUND 57: first AUDIO -- an engine tone driven by the authentic
+ * rpm. This is a synthesized placeholder (two detuned saws + a sub
+ * square, pitch 55..280 Hz over the 0..0x2710 rpm range, plus a
+ * white-noise breath scaled by drift slip); the REAL sound will come
+ * from RR.VH/RR.VB (VAB) in a future round. Kept wholly inside the
+ * SDL build; the headless binary stays silent and identical. */
+static SDL_AudioDeviceID s_audio_dev = 0;
+/* ROUND 59: the REAL engine sample -- --vabfiles <RR.VH> <RR.VB>
+ * decodes the player model's own engine VAG (program = model id,
+ * programs 0-16 are the per-car engine family, round 58) into PCM at
+ * load; the callback then LOOPS it with an rpm-driven resample step
+ * instead of synthesizing. Synth remains the no-VAB fallback. */
+static int16_t *s_vag_pcm = NULL;
+static size_t s_vag_len = 0;
+/* ROUND 60: the skid voice. Programs 17-27 are multi-tone mixes; VAGs
+ * 19/20 appear in nearly every one of them (the shared tire/scrub
+ * components) -- VAG 20 looped at fixed pitch, mixed in at a volume
+ * proportional to the authentic drift slip, is the skid layer. */
+static int16_t *s_skid_pcm = NULL;
+static size_t s_skid_len = 0;
+static volatile int32_t s_audio_rpm = 0;
+static volatile int32_t s_audio_slip = 0;
+static volatile int s_audio_on = 0;
+static uint32_t s_audio_noise = 0x12345678u;
+
+static void engine_audio_cb(void *userdata, Uint8 *stream, int len)
+{
+    static double ph1 = 0.0, ph2 = 0.0, ph3 = 0.0;
+    int16_t *out = (int16_t *)stream;
+    int n = len / 2, i;
+    double rpm = (double)s_audio_rpm;
+    double slip = (double)(s_audio_slip < 0 ? -s_audio_slip : s_audio_slip);
+    double f = 55.0 + rpm / 10000.0 * 225.0;
+    double amp = s_audio_on ? 5000.0 : 0.0;
+    double nz = slip > 60.0 ? 1200.0 : slip * 20.0;
+    (void)userdata;
+    if (s_vag_pcm != NULL) {
+        /* real engine loop: resample step ~ rpm (the sample sounds
+         * near idle at ~0.55x and near redline at ~1.9x -- the exact
+         * center-89/shift-70 pitch law is a future refinement) */
+        static double pos = 0.0, spos = 0.0;
+        double step = (0.55 + rpm / 10000.0 * 1.35) * 0.5;
+        double skid_amp = slip > 40.0 ? (slip - 40.0) / 160.0 : 0.0;
+        if (skid_amp > 0.9) skid_amp = 0.9;
+        for (i = 0; i < n; i++) {
+            double v;
+            size_t i0;
+            s_audio_noise = s_audio_noise * 1664525u + 1013904223u;
+            pos += step;
+            if (pos >= (double)s_vag_len) pos -= (double)s_vag_len;
+            i0 = (size_t)pos;
+            v = (double)s_vag_pcm[i0] * (s_audio_on ? 0.8 : 0.0)
+              + ((double)(s_audio_noise >> 16) / 65535.0 - 0.5) * nz;
+            if (s_skid_pcm != NULL && skid_amp > 0.0 && s_audio_on) {
+                spos += 0.5;
+                if (spos >= (double)s_skid_len) spos -= (double)s_skid_len;
+                v += (double)s_skid_pcm[(size_t)spos] * skid_amp;
+            }
+            if (v > 32000.0) v = 32000.0;
+            if (v < -32000.0) v = -32000.0;
+            out[i] = (int16_t)v;
+        }
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        double v;
+        ph1 += f / 44100.0;
+        ph2 += f * 1.011 / 44100.0;
+        ph3 += f * 0.5 / 44100.0;
+        if (ph1 >= 1.0) ph1 -= 1.0;
+        if (ph2 >= 1.0) ph2 -= 1.0;
+        if (ph3 >= 1.0) ph3 -= 1.0;
+        s_audio_noise = s_audio_noise * 1664525u + 1013904223u;
+        v = (ph1 - 0.5) * amp + (ph2 - 0.5) * amp * 0.6
+          + (ph3 < 0.5 ? -1.0 : 1.0) * amp * 0.25
+          + ((double)(s_audio_noise >> 16) / 65535.0 - 0.5) * nz;
+        if (v > 32000.0) v = 32000.0;
+        if (v < -32000.0) v = -32000.0;
+        out[i] = (int16_t)v;
+    }
+}
+
+static void engine_audio_start(void)
+{
+    SDL_AudioSpec want, have;
+    if (s_audio_dev != 0)
+        return;
+    SDL_memset(&want, 0, sizeof want);
+    want.freq = 44100;
+    want.format = AUDIO_S16SYS;
+    want.channels = 1;
+    want.samples = 1024;
+    want.callback = engine_audio_cb;
+    s_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (s_audio_dev != 0)
+        SDL_PauseAudioDevice(s_audio_dev, 0);
+}
+
+static void engine_vag_load(const char *vh_path, const char *vb_path,
+                            int model)
+{
+    FILE *f;
+    uint8_t *vh = NULL, *vb = NULL;
+    long vhn, vbn;
+    VabHeader h;
+    int vag;
+    f = fopen(vh_path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); vhn = ftell(f); fseek(f, 0, SEEK_SET);
+    vh = malloc((size_t)vhn);
+    if (!vh || fread(vh, 1, (size_t)vhn, f) != (size_t)vhn) { fclose(f); free(vh); return; }
+    fclose(f);
+    f = fopen(vb_path, "rb");
+    if (!f) { free(vh); return; }
+    fseek(f, 0, SEEK_END); vbn = ftell(f); fseek(f, 0, SEEK_SET);
+    vb = malloc((size_t)vbn);
+    if (!vb || fread(vb, 1, (size_t)vbn, f) != (size_t)vbn) { fclose(f); free(vh); free(vb); return; }
+    fclose(f);
+    if (vab_parse(vh, (size_t)vhn, &h) == 0) {
+        if (model < 0 || model > 16) model = 0;
+        vag = h.tone[model][0].vag;
+        if (vag >= 1) {
+            size_t cap = (size_t)h.vag_len[vag] / 16 * 28 + 28;
+            int16_t *pcm = malloc(cap * sizeof(int16_t));
+            size_t n = pcm ? vab_decode_vag(&h, vag, vb, (size_t)vbn, pcm, cap) : 0;
+            if (n > 1000) {
+                s_vag_pcm = pcm;
+                s_vag_len = n;
+                printf("--vabfiles: engine VAG %d decoded (%zu samples) "
+                       "for model %d\n", vag, n, model);
+            } else {
+                free(pcm);
+            }
+        }
+        /* skid layer: VAG 20 (see note at s_skid_pcm) */
+        {
+            size_t cap = (size_t)h.vag_len[20] / 16 * 28 + 28;
+            int16_t *pcm = cap > 28 ? malloc(cap * sizeof(int16_t)) : NULL;
+            size_t n = pcm ? vab_decode_vag(&h, 20, vb, (size_t)vbn, pcm, cap) : 0;
+            if (n > 1000) {
+                s_skid_pcm = pcm;
+                s_skid_len = n;
+                printf("--vabfiles: skid VAG 20 decoded (%zu samples)\n", n);
+            } else {
+                free(pcm);
+            }
+        }
+    }
+    free(vh);
+    free(vb);
+}
+
 /* Cosine-based color cycler: three sine waves 120 degrees apart give a
  * smooth, seamless-looping RGB cycle. `phase` offsets which point in
  * the cycle a given call starts at (used to desync the corner
@@ -969,7 +2040,7 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         ? "rr-pc-port (real track demo -- decoded from MAP.RRM/IDX.HED)"
         : "rr-pc-port (phase 3 -- software rasterizer)";
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         printf("SDL_Init failed (%s) -- continuing headless\n", SDL_GetError());
         return 1;
     }
@@ -1024,10 +2095,16 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                    "drive: up/down move, left/right turn, +/- height, "
                    "P toggles autopilot (auto-drives a lap using the "
                    "confirmed section-order path -- any direction key "
-                   "hands control back); "
+                   "hands control back), "
+                   "C toggles real-physics driving mode (src/physics.c's "
+                   "gearbox + integration model -- up/down = throttle/"
+                   "brake, left/right = steer, hold shift for manual "
+                   "gear changes; see src/physics.h for what's a "
+                   "confirmed RE'd formula vs. an approximation); "
                    "R resets the active view\n");
             s_track_view_mode = TRACK_VIEW_TOP;
             s_autopilot_on = 0;
+            s_physics_mode = 0;
             track_view_reset(track);
         }
     }
@@ -1057,19 +2134,67 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                                     track_view_build_autopilot_path(track);
                                 }
                                 s_autopilot_on = !s_autopilot_on;
+                                s_physics_mode = 0;
+                                break;
+                            case SDLK_c:
+                                s_autopilot_on = 0;
+                                s_physics_mode = !s_physics_mode;
+                                if (s_physics_mode) {
+                                    /* Hand off the current free-cam pose to the
+                                     * physics car so toggling on doesn't jump
+                                     * the view. */
+                                    physics_car_init(&s_physics_car, s_cam_x, s_cam_z, s_cam_yaw);
+                                    s_psx_active = s_physics_trackdata_loaded;
+                                    if (s_psx_active) {
+                                        /* AUTHENTIC core (rounds 40-42): convert the
+                                         * cam yaw (radians, forward=(sin,cos)) into
+                                         * the core's BAM frame (forward=(cos,sin)). */
+                                        long bam = lround(atan2(cos(s_cam_yaw), sin(s_cam_yaw))
+                                                          / (2.0 * M_PI) * 4096.0) & PSX_BAM_MASK;
+                                        s_psx_bridge.td = s_physics_trackdata;
+                                        psx_bridge_iface(&s_psx_bridge, &s_psx_iface);
+                                        psx_car_init(&s_psx_car,
+                                                     (int32_t)lround(s_cam_x),
+                                                     (int32_t)lround(s_cam_z),
+                                                     (int32_t)bam);
+                                        psx_bridge_seed(&s_psx_bridge, s_psx_car.pos_x, s_psx_car.pos_z);
+                                        s_psx_accum = 0.0;
+                                        printf("AUTHENTIC PS1 physics mode ON (physics_psx.c, the "
+                                               "fixed-point core traced from func_8001C490 -- rounds "
+                                               "40-42): up = throttle, down = brake, left/right = "
+                                               "steer, shift+up/down = manual shift; real course "
+                                               "widths as walls\n");
+                                        break;
+                                    }
+                                    printf("real-physics driving mode ON (float fallback model from "
+                                           "src/physics.c -- load --physicsdata <PSX.EXE> for the "
+                                           "authentic fixed-point core); "
+                                           "up/down = throttle/brake, left/right = steer, "
+                                           "shift+up/down = manual gear change\n");
+                                } else {
+                                    printf("real-physics driving mode off\n");
+                                }
                                 break;
                             case SDLK_UP:
-                                s_autopilot_on = 0;
-                                s_cam_x += sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
-                                s_cam_z += cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                if (!s_physics_mode) {
+                                    s_autopilot_on = 0;
+                                    s_cam_x += sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                    s_cam_z += cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                }
                                 break;
                             case SDLK_DOWN:
-                                s_autopilot_on = 0;
-                                s_cam_x -= sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
-                                s_cam_z -= cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                if (!s_physics_mode) {
+                                    s_autopilot_on = 0;
+                                    s_cam_x -= sin(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                    s_cam_z -= cos(s_cam_yaw) * TRACK_DRIVE_MOVE_STEP;
+                                }
                                 break;
-                            case SDLK_LEFT:  s_autopilot_on = 0; s_cam_yaw -= TRACK_DRIVE_TURN_STEP; break;
-                            case SDLK_RIGHT: s_autopilot_on = 0; s_cam_yaw += TRACK_DRIVE_TURN_STEP; break;
+                            case SDLK_LEFT:
+                                if (!s_physics_mode) { s_autopilot_on = 0; s_cam_yaw -= TRACK_DRIVE_TURN_STEP; }
+                                break;
+                            case SDLK_RIGHT:
+                                if (!s_physics_mode) { s_autopilot_on = 0; s_cam_yaw += TRACK_DRIVE_TURN_STEP; }
+                                break;
                             case SDLK_EQUALS: case SDLK_KP_PLUS:
                                 s_cam_height += TRACK_DRIVE_HEIGHT_STEP;
                                 if (s_cam_height > TRACK_DRIVE_HEIGHT_MAX) s_cam_height = TRACK_DRIVE_HEIGHT_MAX;
@@ -1080,6 +2205,7 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
                                 break;
                             case SDLK_r:
                                 s_autopilot_on = 0;
+                                s_physics_mode = 0;
                                 track_view_reset_drive(track);
                                 break;
                             default: break;
@@ -1119,6 +2245,142 @@ static int run_sdl_loop(const TimPage *tex_page, const TrackDemo *track) {
         last_ticks = now_ticks;
         if (track != NULL && track->ready) {
             track_view_autopilot_update(dt);
+        }
+
+        /* Real-physics driving mode (C toggles, see the SDLK_c case
+         * above): continuous held-key polling rather than the discrete
+         * per-keydown steps the free-cam controls use above, since a
+         * gearbox/throttle car needs to keep accelerating while a key
+         * stays down, not just nudge once per press. Clamp dt the same
+         * defensive way a physics step normally would, in case of a
+         * long hitch (window drag, breakpoint, etc.) -- avoids a single
+         * huge dt flinging the car across the map. */
+        if (s_physics_mode && s_psx_active && track != NULL && track->ready) {
+            /* AUTHENTIC core: digital pad input (as the original), fixed
+             * 30Hz steps accumulated from wall-clock dt. */
+            const Uint8 *keys = SDL_GetKeyboardState(NULL);
+            int shift_mod = (SDL_GetModState() & (KMOD_LSHIFT | KMOD_RSHIFT)) != 0;
+            PsxInput pin;
+            double step_dt = dt > 0.1 ? 0.1 : dt;
+            memset(&pin, 0, sizeof pin);
+            pin.throttle = keys[SDL_SCANCODE_UP] && !shift_mod;
+            pin.brake = keys[SDL_SCANCODE_DOWN] && !shift_mod;
+            pin.steer_left = keys[SDL_SCANCODE_LEFT] != 0;
+            pin.steer_right = keys[SDL_SCANCODE_RIGHT] != 0;
+            s_psx_car.manual = shift_mod;
+            s_psx_accum += step_dt;
+            while (s_psx_accum >= 1.0 / 30.0) {
+                static int up_was = 0, dn_was = 0;
+                s_psx_accum -= 1.0 / 30.0;
+                pin.shift_up = shift_mod && keys[SDL_SCANCODE_UP] && !up_was;
+                pin.shift_down = shift_mod && keys[SDL_SCANCODE_DOWN] && !dn_was;
+                up_was = shift_mod && keys[SDL_SCANCODE_UP];
+                dn_was = shift_mod && keys[SDL_SCANCODE_DOWN];
+                psx_car_frame(&s_psx_car, &pin, &s_psx_iface);
+                psx_bridge_resolve(&s_psx_bridge, &s_psx_car);
+                s_audio_rpm = s_psx_car.rpm;   /* ROUND 57: engine tone */
+                s_audio_slip = s_psx_car.slip_last;
+                s_audio_on = 1;
+                engine_audio_start();
+                {
+                    static int lap_prev2 = 0;
+                    int nsec2 = (int)s_psx_bridge.td.count;
+                    if (lap_prev2 > nsec2 - 8 && s_psx_bridge.cur < 8)
+                        s_hud_lap++;
+                    lap_prev2 = s_psx_bridge.cur;
+                }
+                /* ROUND 53: the AI opponents race too (visible ahead
+                 * through the windshield -- the player car itself
+                 * stays undrawn in this first-person mode). */
+                ai_step_and_fill(&s_psx_bridge, (double)s_psx_bridge.cur,
+                                 s_obj_buf != NULL);
+            }
+            /* camera follows the car: BAM (forward=(cos,sin)) back to
+             * the render convention (forward=(sin,cos)). */
+            s_cam_x = (double)s_psx_car.pos_x;
+            s_cam_z = (double)s_psx_car.pos_z;
+            s_cam_yaw = atan2(psx_cos(s_psx_car.heading) / 4096.0,
+                              psx_sin(s_psx_car.heading) / 4096.0);
+            s_physics_hud_timer += dt;
+            if (s_physics_hud_timer >= 0.5) {
+                s_physics_hud_timer = 0.0;
+                printf("[psx] gear=%d speed=0x%X rpm=%d %s | sec=%d slip=%d%s%s\n",
+                       (int)s_psx_car.gear, (unsigned)s_psx_car.speed,
+                       (int)s_psx_car.rpm,
+                       s_psx_car.manual ? "(manual)" : "(auto)",
+                       s_psx_bridge.cur, (int)s_psx_car.slip_last,
+                       (s_psx_car.wheel_rot & 0x1000) ? " [wheel-blur]" : "",
+                       s_psx_car.spin_state ? " [SPIN]" : "");
+            }
+        } else if (s_physics_mode && track != NULL && track->ready) {
+            const Uint8 *keys = SDL_GetKeyboardState(NULL);
+            double throttle = keys[SDL_SCANCODE_UP] ? 1.0 : 0.0;
+            double brake = keys[SDL_SCANCODE_DOWN] ? 1.0 : 0.0;
+            double steer = 0.0;
+            int shift_mod = (SDL_GetModState() & (KMOD_LSHIFT | KMOD_RSHIFT)) != 0;
+            double step_dt = dt > 0.1 ? 0.1 : dt;
+
+            if (keys[SDL_SCANCODE_LEFT]) steer -= 1.0;
+            if (keys[SDL_SCANCODE_RIGHT]) steer += 1.0;
+            s_physics_car.manual_transmission = shift_mod;
+
+            physics_gearbox_update(&s_physics_car, throttle,
+                                    shift_mod && keys[SDL_SCANCODE_UP],
+                                    shift_mod && keys[SDL_SCANCODE_DOWN], step_dt);
+
+            /* Round 15: off-track status now feeds the physics EVERY
+             * FRAME, not just the 0.5s HUD readout. Uses
+             * physics_find_section_local_walk seeded with last frame's
+             * index -- O(1) amortized (a handful of steps at most), so
+             * running it every frame instead of twice a second is cheap
+             * (unlike physics_find_nearest_section's full O(n) scan,
+             * which is exactly why round 11 ported the local-walk
+             * version in the first place). Falls back to "on track" when
+             * no course data was loaded via --physicsdata. */
+            {
+                int sec_idx = -1;
+                double along = 0.0, lateral = 0.0;
+                int offtrack = 0;
+                double wall_gradient = 0.0;
+
+                if (s_physics_trackdata_loaded) {
+                    sec_idx = physics_find_section_local_walk(&s_physics_car, &s_physics_trackdata,
+                                                                s_physics_section_index);
+                    s_physics_section_index = sec_idx;
+                    if (sec_idx >= 0) {
+                        offtrack = physics_track_project(&s_physics_car,
+                            &s_physics_trackdata.sections[sec_idx], &along, &lateral);
+                        /* Round 17: continuous "grazing the wall" gradient,
+                         * see physics_wall_probe_lateral_gradient's doc
+                         * comment in physics.h -- computed against the
+                         * same section already found above. */
+                        wall_gradient = physics_wall_probe_lateral_gradient(&s_physics_car,
+                            &s_physics_trackdata.sections[sec_idx]);
+                    }
+                }
+
+                physics_car_integrate(&s_physics_car, throttle, brake, steer, offtrack,
+                                       wall_gradient, step_dt);
+
+                s_cam_x = s_physics_car.x;
+                s_cam_z = s_physics_car.z;
+                s_cam_yaw = s_physics_car.heading;
+
+                s_physics_hud_timer += dt;
+                if (s_physics_hud_timer >= 0.5) {
+                    s_physics_hud_timer = 0.0;
+                    if (s_physics_trackdata_loaded) {
+                        printf("[physics] gear=%d speed=%.1f rpm=%.0f %s | section=%d lateral=%.1f %s\n",
+                               s_physics_car.gear, s_physics_car.speed, s_physics_car.rpm,
+                               s_physics_car.manual_transmission ? "(manual)" : "(auto)",
+                               sec_idx, lateral, offtrack ? "OFF-TRACK" : "on track");
+                    } else {
+                        printf("[physics] gear=%d speed=%.1f rpm=%.0f %s\n",
+                               s_physics_car.gear, s_physics_car.speed, s_physics_car.rpm,
+                               s_physics_car.manual_transmission ? "(manual)" : "(auto)");
+                    }
+                }
+            }
         }
 
         if (tex_page != NULL) {
@@ -1167,12 +2429,150 @@ int main(int argc, char **argv) {
     memset(&track_tex_file, 0, sizeof(track_tex_file));
     memset(&track, 0, sizeof(track));
 
-    if (argc > 1 && strcmp(argv[1], "--track") == 0) {
-        if (argc > 2) track_map_path = argv[2];
-        if (argc > 3) track_idx_path = argv[3];
-        if (argc > 4) track_tex_path = argv[4];
-    } else if (argc > 1) {
-        tex_path = argv[1];
+    /* --physicsdata <PSX.EXE> can appear anywhere in argv (not
+     * positional) so it composes freely with both the plain texture-demo
+     * arg and --track's own positional args below -- scan and pull it
+     * out (both tokens) BEFORE the positional parsing so it can never be
+     * misread as one of --track's positional slots (map/idx/tex path). */
+    {
+        int i, j;
+        const char *physicsdata_path = NULL;
+        /* ROUND 43: --selfdrive <N> <prefix> -- headless capture mode:
+         * the AUTHENTIC physics core (physics_psx.c) drives the real
+         * course with the round-42 harness driver while the 3D drive
+         * renderer draws each frame; every 2nd frame is dumped as
+         * <prefix>NNNN.ppm. Requires --track and --physicsdata. */
+        /* ROUND 51: --objfile <OBJ.RRO> -- loads the car/object models. */
+        for (i = 1; i + 1 < argc; i++) {
+            if (strcmp(argv[i], "--objfile") == 0) {
+                if (!obj_load(argv[i + 1]))
+                    printf("--objfile: load/parse failed for '%s'\n", argv[i + 1]);
+                for (j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+                argc -= 2;
+                break;
+            }
+        }
+        /* ROUND 45: --texdir <dir> -- loads dir/TEX0.TMS..TEX4.TMS into
+         * the recreated PS1 VRAM for real per-quad track textures. */
+        for (i = 1; i + 1 < argc; i++) {
+            if (strcmp(argv[i], "--texdir") == 0) {
+                int bank;
+                if (psx_vram_init(&s_vram) == 0) {
+                    int total = 0;
+                    for (bank = 0; bank <= 4; bank++) {
+                        char pth[512];
+                        FILE *tf;
+                        snprintf(pth, sizeof(pth), "%s/TEX%d.TMS", argv[i + 1], bank);
+                        tf = fopen(pth, "rb");
+                        if (tf != NULL) {
+                            long tsz;
+                            uint8_t *tbuf;
+                            fseek(tf, 0, SEEK_END); tsz = ftell(tf); fseek(tf, 0, SEEK_SET);
+                            tbuf = (tsz > 0) ? (uint8_t *)malloc((size_t)tsz) : NULL;
+                            if (tbuf != NULL && fread(tbuf, 1, (size_t)tsz, tf) == (size_t)tsz)
+                                total += psx_vram_load_tms(&s_vram, tbuf, (size_t)tsz);
+                            free(tbuf);
+                            fclose(tf);
+                        }
+                    }
+                    s_vram_loaded = total > 0;
+                    printf("--texdir: %d TIM pages blitted into recreated VRAM%s\n",
+                           total, s_vram_loaded ? "" : " (NONE -- check the dir)");
+                }
+                /* pull both tokens out of argv so the positional
+                 * --track parsing below can't misread them */
+                for (j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+                argc -= 2;
+                break;
+            }
+        }
+        /* scan --selfdrive first: the --physicsdata scan below breaks
+         * out of its loop once found, which would skip any flag that
+         * comes after it on the command line. */
+        for (i = 1; i + 2 < argc; i++) {
+            if (strcmp(argv[i], "--selfdrive") == 0) {
+                s_selfdrive_frames = atoi(argv[i + 1]);
+                s_selfdrive_prefix = argv[i + 2];
+                break;
+            }
+        }
+        /* ROUND 59: --vabfiles <RR.VH> <RR.VB> -- real engine sample.
+         * Spliced out of argv like --texdir so positional parsing
+         * can't misread the tokens. */
+        for (i = 1; i + 2 < argc; i++) {
+            if (strcmp(argv[i], "--vabfiles") == 0) {
+#ifdef HAVE_SDL2
+                engine_vag_load(argv[i + 1], argv[i + 2], 0);
+#endif
+                for (j = i; j < argc - 3; j++) argv[j] = argv[j + 3];
+                argc -= 3;
+                break;
+            }
+        }
+        for (i = 1; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--physicsdata") == 0) {
+                physicsdata_path = argv[i + 1];
+                for (j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+                argc -= 2;
+                break;
+            }
+        }
+
+        if (argc > 1 && strcmp(argv[1], "--track") == 0) {
+            if (argc > 2) track_map_path = argv[2];
+            if (argc > 3) track_idx_path = argv[3];
+            if (argc > 4) track_tex_path = argv[4];
+        } else if (argc > 1) {
+            tex_path = argv[1];
+        }
+
+        /* Loads the real course section-geometry table (tools/trackdata)
+         * from the user's own PSX.EXE for live off-track feedback in the
+         * C (real-physics) drive mode. See s_physics_trackdata's
+         * declaration above and ROADMAP.md Phase 7. */
+        if (physicsdata_path != NULL) {
+            FILE *f = fopen(physicsdata_path, "rb");
+            if (f == NULL) {
+                printf("--physicsdata: could not open '%s'\n", physicsdata_path);
+            } else {
+                long fsize;
+                uint8_t *exe_buf;
+                fseek(f, 0, SEEK_END);
+                fsize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                exe_buf = (fsize > 0) ? (uint8_t *)malloc((size_t)fsize) : NULL;
+                if (exe_buf != NULL && fread(exe_buf, 1, (size_t)fsize, f) == (size_t)fsize) {
+                    int rc = trackdata_parse(exe_buf, (size_t)fsize, TRACKDATA_COURSE_A_RAM_ADDR,
+                                              TRACKDATA_COURSE_A_COUNT, &s_physics_trackdata);
+                    if (rc == TRACKDATA_OK) {
+                        s_physics_trackdata_loaded = 1;
+                        printf("--physicsdata: loaded course A geometry from '%s' (%zu sections)\n",
+                               physicsdata_path, s_physics_trackdata.count);
+                        /* ROUND 53: the per-model piece-kit table
+                         * D_80059228 lives in the same EXE (bodies,
+                         * LODs, axle objects + rear-axle offsets --
+                         * see psx_ai.h). Extracted here, never
+                         * committed anywhere. */
+                        if (psx_ai_kit_from_exe(exe_buf, (size_t)fsize))
+                            printf("--physicsdata: car piece-kit table "
+                                   "D_80059228 extracted (13 models)\n");
+                        /* ROUND 55: real race setup -- grid roster,
+                         * start spread, per-car pace (psx_ai.h). */
+                        if (psx_ai_race_from_exe(exe_buf, (size_t)fsize))
+                            printf("--physicsdata: race setup extracted "
+                                   "(roster/grid/pace, func_80021048)\n");
+                    } else {
+                        printf("--physicsdata: failed to parse course data from '%s' (rc=%d) -- "
+                               "real-physics mode will still work, just without live off-track "
+                               "feedback\n", physicsdata_path, rc);
+                    }
+                } else {
+                    printf("--physicsdata: could not read '%s'\n", physicsdata_path);
+                }
+                free(exe_buf);
+                fclose(f);
+            }
+        }
     }
 
     printf("rr-pc-port phase 1+2+3 vertical slice\n");
@@ -1203,6 +2603,139 @@ int main(int argc, char **argv) {
         }
     } else if (track_map_path != NULL) {
         printf("--track requires both <MAP.RRM> <IDX.HED> paths -- falling back to animated demo\n");
+    }
+
+    if (s_selfdrive_frames > 0 && s_selfdrive_prefix != NULL
+        && track.ready && s_physics_trackdata_loaded) {
+        /* ROUND 43 headless capture: authentic core + shared bridge +
+         * round-42 driver, rendered through draw_track_drive_scene. */
+        PsxTrackIface trk;
+        PsxCar car;
+        PsxInput in;
+        int i, dumped = 0;
+        s_psx_bridge.td = s_physics_trackdata;
+        psx_bridge_iface(&s_psx_bridge, &trk);
+        s_psx_bridge.cur = 0;
+        {
+            const TrackSection *s0 = &s_physics_trackdata.sections[0];
+            psx_car_init(&car, (int32_t)lround(s0->x), (int32_t)lround(s0->z),
+                         psx_bridge_road_dir(&s_psx_bridge, 0));
+        }
+        psx_bridge_seed(&s_psx_bridge, car.pos_x, car.pos_z);
+        memset(&in, 0, sizeof in);
+        s_cam_height = 45.0; /* chase-cam driving height, not the freecam default */
+        for (i = 0; i < s_selfdrive_frames; i++) {
+            int32_t steer;
+            {
+                static int32_t prev_lat = 0;
+                int32_t road = psx_bridge_road_dir(&s_psx_bridge, s_psx_bridge.cur);
+                int32_t lat = (int32_t)lround(psx_bridge_lat(&s_psx_bridge,
+                        s_psx_bridge.cur, (double)car.pos_x, (double)car.pos_z));
+                steer = psx_angdiff(car.vel_dir, road) * 24
+                      - lat * 8 - (lat - prev_lat) * 40;
+                prev_lat = lat;
+                if (steer < -0x1000) steer = -0x1000;
+                if (steer > 0x1000) steer = 0x1000;
+            }
+            {
+                int32_t target = psx_bridge_corner_target(&s_psx_bridge);
+                in.throttle = car.speed < target;
+                in.brake = car.speed > target + 0x80;
+            }
+            psx_car_frame_steer(&car, &in, &trk, steer);
+            psx_bridge_resolve(&s_psx_bridge, &car);
+            {
+                static int lap_prev = 0;
+                int nsec = (int)s_psx_bridge.td.count;
+                if (lap_prev > nsec - 8 && s_psx_bridge.cur < 8)
+                    s_hud_lap++;
+                lap_prev = s_psx_bridge.cur;
+            }
+            {
+                /* ROUND 51: chase cam WITH a collision probe -- pull
+                 * the camera in whenever its would-be position leaves
+                 * the track width (checked through the same bridge
+                 * lateral test the physics uses). */
+                double fx = psx_cos(car.heading) / 4096.0;
+                double fz = psx_sin(car.heading) / 4096.0;
+                double dist = 300.0;
+                int probe;
+                int saved_cur = s_psx_bridge.cur; /* preserve the deck-
+                    continuity walk state -- a full re-seed at the car
+                    can snap to the WRONG DECK at the overpass and
+                    derail the driver (found round 51) */
+                /* ROUND 53 camera fix: the round-51 probe demanded the
+                 * camera inside 55% of the width and cut the distance
+                 * by 45% per try -- on any real corner the straight-
+                 * line point 300 behind the car leaves the road, so
+                 * the loop collapsed dist to ~9 and parked the camera
+                 * INSIDE the car model (the mid-lap "red polygon
+                 * soup" every static GIF since round 48 hid). Now:
+                 * accept anywhere on the actual road width, back off
+                 * gently, and never come closer than 140. */
+                for (probe = 0; probe < 6; probe++) {
+                    double cx2 = (double)car.pos_x - fx * dist;
+                    double cz2 = (double)car.pos_z - fz * dist;
+                    const TrackSection *sc2;
+                    double lat2, w2;
+                    psx_bridge_seed(&s_psx_bridge, (int32_t)cx2, (int32_t)cz2);
+                    sc2 = &s_psx_bridge.td.sections[s_psx_bridge.cur];
+                    lat2 = psx_bridge_lat(&s_psx_bridge, s_psx_bridge.cur, cx2, cz2);
+                    w2 = (lat2 > 0 ? sc2->width_right : sc2->width_left) - 12.0;
+                    if (fabs(lat2) <= w2 || dist * 0.78 < 140.0)
+                        break;
+                    dist *= 0.78;
+                }
+                if (dist < 140.0) dist = 140.0;
+                s_cam_x = (double)car.pos_x - fx * dist;
+                s_cam_z = (double)car.pos_z - fz * dist;
+                s_cam_yaw = atan2(fx, fz);
+                s_psx_bridge.cur = saved_cur; /* restore, no re-seed */
+                s_car_draw_on = s_obj_buf != NULL;
+                s_car_draw_x = (double)car.pos_x;
+                s_car_draw_z = (double)car.pos_z;
+                /* the draw path measures heights relative to the
+                 * camera ground sample -- put the car ON that ground */
+                s_car_draw_y = -1.0; /* sentinel: resolved in the draw */
+                s_car_draw_heading = car.heading;
+                s_car_draw_wheel = car.wheel_rot; /* authentic +0x38 */
+                s_car_draw_model = 0;
+                s_draw_cars[0].roll = 0;
+                /* ROUND 53: the real AI opponents (func_80025268 port,
+                 * see psx_ai.h's confirmed/approximated ledger). */
+                ai_step_and_fill(&s_psx_bridge, (double)s_psx_bridge.cur,
+                                 s_obj_buf != NULL);
+            }
+            if ((i & 1) == 0) {
+                char path[512];
+                FILE *pf;
+                int px, py;
+                draw_track_drive_scene(&track);
+                draw_race_hud(car.speed, (int)car.gear, s_hud_lap + 1, car.rpm);
+                snprintf(path, sizeof(path), "%s%04d.ppm", s_selfdrive_prefix, dumped);
+                pf = fopen(path, "wb");
+                if (pf) {
+                    fprintf(pf, "P6\n%d %d\n255\n", GPU_FB_WIDTH, GPU_FB_HEIGHT);
+                    for (py = 0; py < GPU_FB_HEIGHT; py++)
+                        for (px = 0; px < GPU_FB_WIDTH; px++) {
+                            uint32_t t = gpu_framebuffer[py * GPU_FB_WIDTH + px];
+                            fputc((int)((t >> 16) & 0xFF), pf);
+                            fputc((int)((t >> 8) & 0xFF), pf);
+                            fputc((int)(t & 0xFF), pf);
+                        }
+                    fclose(pf);
+                    dumped++;
+                }
+            }
+        }
+        printf("selfdrive capture: %d physics frames, %d ppm frames dumped "
+               "(gear=%d speed=0x%X sec=%d)\n",
+               s_selfdrive_frames, dumped, (int)car.gear,
+               (unsigned)car.speed, s_psx_bridge.cur);
+        trackdata_free(&s_physics_trackdata);
+        track_demo_free(&track);
+        if (tex_file.pages) tim_free(&tex_file);
+        return 0;
     }
 
 #ifdef HAVE_SDL2
@@ -1247,6 +2780,7 @@ int main(int argc, char **argv) {
     tim_free(&tex_file);
     tim_free(&track_tex_file);
     track_demo_free(&track);
+    if (s_physics_trackdata_loaded) trackdata_free(&s_physics_trackdata);
 
     printf("phase 1+2+3 vertical slice complete, exiting 0\n");
     return 0;
