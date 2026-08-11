@@ -1914,3 +1914,20 @@ remapping UI, packaging/distribution. None of this matters until phases
   chrono, tours, position) donc les courses s'enchaînent proprement.
   Microfont étendue (16 lettres) + hud_text pour l'écran de mode.
   0 warning, 5/5 ctest, wine OK, bundle v3 livré.
+
+- **Round 66 — vitres/soubassements + sons de collision + rectification
+  de terminologie.** (a) Prims type-2 (32B, POLY_F4 code 0x29 = semi-
+  trans) enfin rendus : ce sont les compagnons aux+2/aux+3 du kit
+  (classes A/B/C = objets 3/4, 9/10, 19/20, secrète = 254) — canopée
+  vitrée et plaque de soubassement, dessinés en flat sur la course ET
+  au salon (le noir pur remonte en gris-bleu fumé). (b) Sons de
+  collision : VAG 18 (lead des programmes 17-27, center 65 = deux
+  octaves sous le moteur) décodé au chargement, tiré en one-shot
+  depuis la VRAIE branche mur de la physique (integrate(),
+  car->wall_scrape), volume ∝ vitesse, cooldown 18 frames.
+  (c) Terminologie rectifiée partout suite à la remarque publique
+  d'ethteck : rr-decomp est une reconstruction byte-exacte (949/949
+  vérifiés objdiff) dont la décompilation C est EN COURS (63/949) —
+  READMEs des deux repos reformulés + section Transparency (assistance
+  IA) ajoutée, descriptions GitHub corrigées. 0 warning, 5/5, wine OK,
+  bundle v4 livré.
