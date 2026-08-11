@@ -1849,3 +1849,31 @@ remapping UI, packaging/distribution. None of this matters until phases
 - Encore ouvert (au-delà du périmètre "course jouable") : menus/écrans
   hors-course, loi de pitch exacte, PVS func_80015BC4 au rendu,
   gouraud hors-course, push GitHub (sur demande).
+- **Round 61 (XL) -- la boucle de JEU : titre -> course -> classement -> résultats.**
+  (1) BUG FIX : la vraie voie de grille (round 56) était écrasée par le
+  motif par défaut en fin de psx_ai_init -- les adversaires proches
+  partent maintenant de leurs vraies places.
+  (2) POSITION DE COURSE en direct : progression totale (tours x course +
+  section) joueur vs chaque IA active ; affichée en vrais sprites --
+  les italiques "1st/2nd/3rd" de la planche HUD pour le podium, chiffre
+  chromé pour P4-P12. On part P12 derrière le peloton égrené et on
+  remonte, exactement le design RR1.
+  (3) FIN DE COURSE : au tour 3, overlay des VRAIS sprites de résultat
+  ("winner" cursif + "1st" pour la victoire, "2nd"/"3rd"/chiffre sinon).
+  (4) ÉCRAN TITRE INTÉGRÉ AU BINAIRE : le vrai logo "RIDGE RACER"
+  (TEX3 page 36 240x96, VRAM (704,256) -> tpage 0x1B, CLUT 0x7E8C) sur
+  fond damier dégradé nuit, avec la bannière "START" (page 38) qui
+  pulse -- Entrée lance la course en mode interactif ; les captures
+  selfdrive ouvrent dessus (60 frames d'intro).
+  Rects mesurés (page 0) : winner (144,24)-(246,57), 1st (186,55)-(255,90),
+  2nd (150,88)-(255,120), 3rd (150,118)-(255,150).
+- **Round 62 (XL) -- LA SÉLECTION DE VOITURE : les 12 modèles en salon.**
+  Nouvel état de jeu entre le titre et la course : le modèle choisi tourne
+  sur un plateau sombre, rendu avec ses VRAIS prims type-64 (sommets +
+  normales Q12 + queue texture, miroir z et échelle 0.25 comme en course),
+  corps + les deux essieux, tri peintre, éclairage par normales.
+  Gauche/droite parcourt les 12 modèles consommateurs, Entrée lance la
+  course avec : les stats physiques du modèle (psx_car_set_model), sa
+  carrosserie au rendu joueur, ET son propre sample moteur VAG rechargé
+  (programme = id modèle). Les captures selfdrive font défiler le salon
+  (60 frames titre + 90 frames de modèles en rotation) avant la course.
